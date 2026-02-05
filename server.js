@@ -34,8 +34,9 @@ function base64url (buffer){
         .replace(/=+$/, "");
 }
 
-// --- LOGIN AUTHENTIFICATION + CRYPTOGRAPHY HANDSHAKE---
+// --- SPOTIFY REQUEST: Login Authentification + Handshake---
 app.get("/login", async (req, res) => {
+    // PKCE
     const state = crypto.randomBytes(STATE_BYTE_LENGTH).toString("hex");
     const codeVerifier = base64url(crypto.randomBytes(VERIFY_BYTE_LENGTH));
     const codeChallenge = base64url(
@@ -47,4 +48,24 @@ app.get("/login", async (req, res) => {
     res.cookie("spotify_auth_state", state, {httpOnly: true});
     res.cookie("spotify_code_verifier", codeVerifier, {httpOnly: true});
 
+    // Send out request
+    const scope = "user-top-read"; // Request from Spotify
+    const params = new URLSearchParams({
+        response_type: "code",     // Tells Spotify to return an authorization *code*
+        client_id: SPOTIFY_CLIENT_ID,
+        scope,
+        redirect_uri: REDIRECT_URI, // Where Spotify sends the user after login
+        state,
+        code_challenge_method: "S256",
+        code_challenge: codeChallenge
+    });
+
+    res.redirect("https://accounts.spotify.com/authorize?" + params.toString());
 });
+
+// --- CALLBACK: exchange code for access token ---
+app.get("/callback", async (req, res) => {
+    const {code, state} = req.query;
+})
+
+
