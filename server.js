@@ -48,7 +48,7 @@ app.get("/login", async (req, res) => {
     res.cookie("spotify_auth_state", state, {httpOnly: true});
     res.cookie("spotify_code_verifier", codeVerifier, {httpOnly: true});
 
-    // Send out request
+    // Create req params
     const scope = "user-top-read"; // Request from Spotify
     const params = new URLSearchParams({
         response_type: "code",     // Tells Spotify to return an authorization *code*
@@ -59,7 +59,7 @@ app.get("/login", async (req, res) => {
         code_challenge_method: "S256",
         code_challenge: codeChallenge
     });
-
+    // Send out req
     res.redirect("https://accounts.spotify.com/authorize?" + params.toString());
 });
 
