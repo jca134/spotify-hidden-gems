@@ -10,3 +10,4 @@
 /httpRequests/
 # Secret Data
 .env
+node_modules/
