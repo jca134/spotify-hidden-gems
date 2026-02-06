@@ -14,8 +14,10 @@ dotenv.config();
 // App creation
 const app = express();
 
-app.use(cookieParser()); // Allows you to request cookie info
-app.use(express.static("public")); // Simplifies: GET /index.html -> /public/index.html
+// Allows you to request cookie info
+app.use(cookieParser());
+// Simplifies: GET /index.html -> /public/index.html
+app.use(express.static("public"));
 
 // Saving file name and directory of server.js
 // const __filename = fileURLToPath(import.meta.url);
