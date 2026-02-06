@@ -18,8 +18,8 @@ app.use(cookieParser()); // Allows you to request cookie info
 app.use(express.static("public")); // Simplifies: GET /index.html -> /public/index.html
 
 // Saving file name and directory of server.js
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// const __filename = fileURLToPath(import.meta.url);
+// const __dirname = path.dirname(__filename);
 
 const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI } = process.env; // Load from process.env
 
@@ -98,7 +98,7 @@ app.get("/callback", async (req, res) => {
             }
         );
 
-        const { access_token, expires_in, refresh_token } = tokenRes.data;
+        const { access_token, refresh_token } = tokenRes.data;
 
         // Store tokens in cookies
         res.cookie("spotify_access_token", access_token, { httpOnly: true });
@@ -149,20 +149,22 @@ app.get("/api/top-tracks", async (req, res) => {
         });
         res.json(apiRes.data);
     } catch (err) {
-        // Refresh once if unauthorized
         if (err.response?.status === 401) {
-            try {
-                const newToken = await refreshAccessToken(req, res);
-                if (!newToken) throw err;
+            const newToken = await refreshAccessToken(req, res);
 
-                const apiRes2 = await axios.get("https://api.spotify.com/v1/me/top/tracks", {
-                    headers: { Authorization: `Bearer ${newToken}` },
-                    params: { time_range, limit }
-                });
-                return res.json(apiRes2.data);
-            } catch (e2) {
+            if (!newToken) {
                 return res.status(401).json({ error: "Session expired. Please log in again." });
             }
+
+            const apiRes2 = await axios.get(
+                "https://api.spotify.com/v1/me/top/tracks",
+                {
+                    headers: { Authorization: `Bearer ${newToken}` },
+                    params: { time_range, limit }
+                }
+            );
+
+            return res.json(apiRes2.data);
         }
 
         console.error(err?.response?.data || err.message);
