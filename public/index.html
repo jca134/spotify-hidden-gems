@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Spotify Top Tracks</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+<header class="topbar">
+    <div class="wrap topbar-inner">
+        <div class="brand">
+            <div class="logo" aria-hidden="true">♫</div>
+            <div>
+                <div class="brand-title">Spotify Top Tracks</div>
+                <div class="brand-subtitle">See what you’ve been looping lately</div>
+            </div>
+        </div>
+
+        <nav class="actions">
+            <a class="btn" href="/login">Log in</a>
+            <a class="btn ghost" href="/logout">Logout</a>
+        </nav>
+    </div>
+</header>
+
+<main class="wrap">
+    <section class="panel">
+        <div class="panel-head">
+            <h1 class="title">Your top tracks</h1>
+            <p class="muted">Choose a time range, then load your results.</p>
+        </div>
+
+        <div class="controls">
+            <label class="field">
+                <span class="field-label">Time range</span>
+                <select id="timeRange" class="select">
+                    <option value="short_term">Last 4 weeks</option>
+                    <option value="medium_term">Last 6 months</option>
+                    <option value="long_term">All time</option>
+                </select>
+            </label>
+
+            <button class="btn primary" id="loadBtn">Load tracks</button>
+        </div>
+
+        <div id="status" class="status" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="results">
+        <div id="tracks" class="grid"></div>
+    </section>
+</main>
+
+<footer class="footer">
+    <div class="wrap footer-inner">
+        <span class="muted">Built with the Spotify Web API</span>
+    </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
