@@ -83,7 +83,8 @@ async function loadTopTracks() {
         if (!res.ok) {
             // Common Spotify app case: user not logged in / token missing
             if (res.status === 401) {
-                setStatus("You’re not logged in. Click “Log in” at the top, then try again.");
+                // setStatus("You’re not logged in. Click “Log in” at the top, then try again.");
+                setStatus("Spotify App Development currently down.");
                 return;
             }
 
