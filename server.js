@@ -5,7 +5,6 @@ import cookieParser from "cookie-parser"; // lets you read cookies
 import crypto from "crypto"; // Secure random and SHA256
 import path from "path";
 import { fileURLToPath } from "url";
-import res from "express/lib/response";
 
 const STATE_BYTE_LENGTH = 16;
 const VERIFY_BYTE_LENGTH = 32;
@@ -26,7 +25,7 @@ const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI } = process.env; 
 
 // URL Format: https://accounts.spotify.com/authorize? + code_challenge=Ab-c_def...
 // Mute complete code_challenge to access
-function base64url (buffer){
+function base64url(buffer) {
     return buffer
         .toString("base64")
         .replace(/\+/g, "-")
@@ -34,7 +33,7 @@ function base64url (buffer){
         .replace(/=+$/, "");
 }
 
-// --- SPOTIFY REQUEST: Login Authentification + Handshake---
+// --- Login Authentification + Handshake---
 app.get("/login", async (req, res) => {
     // PKCE
     const state = crypto.randomBytes(STATE_BYTE_LENGTH).toString("hex");
@@ -45,13 +44,13 @@ app.get("/login", async (req, res) => {
 
     // Stores to browser cookie and only the server (via HTTP requests)
     // can access info, not JavaScript
-    res.cookie("spotify_auth_state", state, {httpOnly: true});
-    res.cookie("spotify_code_verifier", codeVerifier, {httpOnly: true});
+    res.cookie("spotify_auth_state", state, { httpOnly: true });
+    res.cookie("spotify_code_verifier", codeVerifier, { httpOnly: true });
 
     // Create req params
     const scope = "user-top-read"; // Request from Spotify
     const params = new URLSearchParams({
-        response_type: "code",     // Tells Spotify to return an authorization *code*
+        response_type: "code", // Tells Spotify to return an authorization *code*
         client_id: SPOTIFY_CLIENT_ID,
         scope,
         redirect_uri: REDIRECT_URI, // Where Spotify sends the user after login
@@ -59,13 +58,119 @@ app.get("/login", async (req, res) => {
         code_challenge_method: "S256",
         code_challenge: codeChallenge
     });
-    // Send out req
+
     res.redirect("https://accounts.spotify.com/authorize?" + params.toString());
 });
 
 // --- CALLBACK: exchange code for access token ---
 app.get("/callback", async (req, res) => {
-    const {code, state} = req.query;
-})
+    // Gets authentification code
+    // Code makes it so data can't be accessed by others
+    // State ensures callback query is the same one sent out
+    const { code, state } = req.query;
+    const storedState = req.cookies.spotify_auth_state;
+    const codeVerifier = req.cookies.spotify_code_verifier;
 
+    if (!state || state !== storedState) {
+        return res.status(400).send("State mismatch. Try again.");
+    }
 
+    // PKCE established. Request for authorization_code
+    try {
+        const tokenRes = await axios.post(
+            "https://accounts.spotify.com/api/token",
+            new URLSearchParams({
+                grant_type: "authorization_code",
+                code,
+                redirect_uri: REDIRECT_URI,
+                client_id: SPOTIFY_CLIENT_ID,
+                code_verifier: codeVerifier
+            }),
+            {
+                headers: { "Content-Type": "application/x-www-form-urlencoded" }
+            }
+        );
+
+        const { access_token, expires_in, refresh_token } = tokenRes.data;
+
+        // Store tokens in cookies
+        res.cookie("spotify_access_token", access_token, { httpOnly: true });
+        if (refresh_token) {
+            res.cookie("spotify_refresh_token", refresh_token, { httpOnly: true });
+        }
+        res.cookie("spotify_expires_at", String(Date.now() + expires_in * 1000), { httpOnly: true });
+
+        res.redirect("/");
+    } catch (err) {
+        console.error(err?.response?.data || err.message);
+        res.status(500).send("Token exchange failed.");
+    }
+});
+
+// Helper: refresh token when needed
+async function refreshAccessToken(req, res) {
+    const refreshToken = req.cookies.spotify_refresh_token;
+    if (!refreshToken) return null;
+
+    const tokenRes = await axios.post(
+        "https://accounts.spotify.com/api/token",
+        new URLSearchParams({
+            grant_type: "refresh_token",
+            refresh_token: refreshToken,
+            client_id: SPOTIFY_CLIENT_ID,
+            client_secret: SPOTIFY_CLIENT_SECRET
+        }),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+
+    const { access_token } = tokenRes.data;
+    res.cookie("spotify_access_token", access_token, { httpOnly: true });
+    return access_token;
+}
+
+// --- API: Top Tracks ---
+app.get("/api/top-tracks", async (req, res) => {
+    const time_range = req.query.time_range || "short_term"; // short_term, medium_term, long_term
+    const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
+
+    let accessToken = req.cookies.spotify_access_token;
+    if (!accessToken) return res.status(401).json({ error: "Not logged in" });
+
+    try {
+        const apiRes = await axios.get("https://api.spotify.com/v1/me/top/tracks", {
+            headers: { Authorization: `Bearer ${accessToken}` },
+            params: { time_range, limit }
+        });
+        res.json(apiRes.data);
+    } catch (err) {
+        // Refresh once if unauthorized
+        if (err.response?.status === 401) {
+            try {
+                const newToken = await refreshAccessToken(req, res);
+                if (!newToken) throw err;
+
+                const apiRes2 = await axios.get("https://api.spotify.com/v1/me/top/tracks", {
+                    headers: { Authorization: `Bearer ${newToken}` },
+                    params: { time_range, limit }
+                });
+                return res.json(apiRes2.data);
+            } catch (e2) {
+                return res.status(401).json({ error: "Session expired. Please log in again." });
+            }
+        }
+
+        console.error(err?.response?.data || err.message);
+        res.status(500).json({ error: "Spotify API call failed" });
+    }
+});
+
+// --- LOGOUT ---
+app.get("/logout", (req, res) => {
+    res.clearCookie("spotify_access_token");
+    res.clearCookie("spotify_refresh_token");
+    res.clearCookie("spotify_auth_state");
+    res.clearCookie("spotify_code_verifier");
+    res.redirect("/");
+});
+
+app.listen(3000, () => console.log("Server running on http://localhost:3000"));
