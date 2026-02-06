@@ -44,7 +44,14 @@ app.get("/login", async (req, res) => {
 
     // Stores to browser cookie and only the server (via HTTP requests)
     // can access info, not JavaScript
-    res.cookie("spotify_auth_state", state, { httpOnly: true });
+
+    const cookieOpts = {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: false // set true when using https in production
+    };
+
+    res.cookie("spotify_auth_state", state, cookieOpts);
     res.cookie("spotify_code_verifier", codeVerifier, { httpOnly: true });
 
     // Create req params
@@ -98,7 +105,6 @@ app.get("/callback", async (req, res) => {
         if (refresh_token) {
             res.cookie("spotify_refresh_token", refresh_token, { httpOnly: true });
         }
-        res.cookie("spotify_expires_at", String(Date.now() + expires_in * 1000), { httpOnly: true });
 
         res.redirect("/");
     } catch (err) {
