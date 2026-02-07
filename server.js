@@ -141,7 +141,7 @@ app.get("/api/top-tracks", async (req, res) => {
     const time_range = req.query.time_range || "short_term"; // short_term, medium_term, long_term
     const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
 
-    let accessToken = req.cookies["spotify_code_verifier"];
+    let accessToken = req.cookies["spotify_access_token"];
 
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
