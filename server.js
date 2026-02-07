@@ -3,8 +3,8 @@ import axios from "axios"; // Spotify HTTP requests
 import dotenv from "dotenv"; // loads .env to process.env
 import cookieParser from "cookie-parser"; // lets you read cookies
 import crypto from "crypto"; // Secure random and SHA256
-import path from "path";
-import { fileURLToPath } from "url";
+// import path from "path";
+// import { fileURLToPath } from "url";
 
 const STATE_BYTE_LENGTH = 16;
 const VERIFY_BYTE_LENGTH = 32;
@@ -77,8 +77,8 @@ app.get("/callback", async (req, res) => {
     // Code makes it so data can't be accessed by others
     // State ensures callback query is the same one sent out
     const { code, state } = req.query;
-    const storedState = req.cookies.spotify_auth_state;
-    const codeVerifier = req.cookies.spotify_code_verifier;
+    const storedState = req.cookies["spotify_auth_state"];
+    const codeVerifier = req.cookies["spotify_code_verifier"];
 
     if (!state || state !== storedState) {
         return res.status(400).send("State mismatch. Try again.");
@@ -141,7 +141,8 @@ app.get("/api/top-tracks", async (req, res) => {
     const time_range = req.query.time_range || "short_term"; // short_term, medium_term, long_term
     const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
 
-    let accessToken = req.cookies.spotify_access_token;
+    let accessToken = req.cookies["spotify_code_verifier"];
+
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
     try {
@@ -182,6 +183,5 @@ app.get("/logout", (req, res) => {
     res.clearCookie("spotify_code_verifier");
     res.redirect("/");
 });
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
