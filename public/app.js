@@ -1,22 +1,24 @@
-// app.js
-
 const tracksEl = document.getElementById("tracks");
 const statusEl = document.getElementById("status");
 const timeRangeEl = document.getElementById("timeRange");
 const loadBtn = document.getElementById("loadBtn");
 
+const popularitySliderEl = document.getElementById("popularitySlider");
+const popularityInputEl = document.getElementById("popularityInput");
+const popularityHintEl = document.getElementById("popularityHint");
+
 // Small helper to avoid XSS if track names contain weird characters
 function escapeHtml(str) {
     return String(str).replace(/[&<>"']/g, (ch) => {
-        const map = {
-            "&": "&amp;",
-            "<": "&lt;",
-            ">": "&gt;",
-            '"': "&quot;",
-            "'": "&#39;"
-        };
+        const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
         return map[ch] || ch;
     });
+}
+
+function clampInt(n, min, max, fallback) {
+    const x = parseInt(String(n), 10);
+    if (Number.isNaN(x)) return fallback;
+    return Math.max(min, Math.min(max, x));
 }
 
 function setStatus(msg) {
@@ -28,6 +30,24 @@ function setLoading(isLoading) {
     loadBtn.textContent = isLoading ? "Loading..." : "Load tracks";
 }
 
+// Keep slider + number input synced
+function setPopularityUI(val) {
+    popularitySliderEl.value = String(val);
+    popularityInputEl.value = String(val);
+    popularityHintEl.innerHTML = `Showing tracks with popularity ≤ <strong>${val}</strong>`;
+}
+
+// init
+setPopularityUI(clampInt(popularitySliderEl.value, 0, 100, 100));
+
+popularitySliderEl.addEventListener("input", () => {
+    setPopularityUI(clampInt(popularitySliderEl.value, 0, 100, 100));
+});
+
+popularityInputEl.addEventListener("input", () => {
+    setPopularityUI(clampInt(popularityInputEl.value, 0, 100, 100));
+});
+
 function trackCard(track, i) {
     const img =
         track?.album?.images?.[1]?.url ||
@@ -35,26 +55,28 @@ function trackCard(track, i) {
         "";
 
     const title = escapeHtml(track?.name ?? "Unknown track");
-    const artists = escapeHtml(
-        (track?.artists ?? []).map((a) => a.name).join(", ") || "Unknown artist"
-    );
+    const artists = escapeHtml((track?.artists ?? []).map((a) => a.name).join(", ") || "Unknown artist");
 
+    const popularity = typeof track?.popularity === "number" ? track.popularity : "N/A";
     const url = track?.external_urls?.spotify || "#";
 
-    // This markup matches your CSS:
-    // .card is a row, image 56x56, text grouped, etc.
     return `
     <div class="card" role="article">
       ${img ? `<img src="${img}" alt="Album art for ${title}" loading="lazy" />` : ""}
 
-      <div class="card-body" style="display:flex; flex-direction:column; gap:4px; min-width:0;">
+      <div class="card-body">
         <div class="rank">#${i + 1}</div>
-        <div class="card-title" title="${title}" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+
+        <div class="card-title" title="${title}">
           ${title}
         </div>
-        <div class="card-subtitle" title="${artists}" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+
+        <div class="card-subtitle" title="${artists}">
           ${artists}
         </div>
+
+        <div class="popularity">Popularity: ${popularity}</div>
+
         <a class="link" target="_blank" rel="noopener noreferrer" href="${url}">
           Open in Spotify
         </a>
@@ -70,41 +92,40 @@ async function loadTopTracks() {
         tracksEl.innerHTML = "";
 
         const timeRange = timeRangeEl.value;
+        const maxPopularity = clampInt(popularitySliderEl.value, 0, 100, 100);
 
         const res = await fetch(
-            `/api/top-tracks?time_range=${encodeURIComponent(timeRange)}&limit=20`,
+            `/api/top-tracks?time_range=${encodeURIComponent(timeRange)}&max_popularity=${encodeURIComponent(maxPopularity)}`,
             { headers: { Accept: "application/json" } }
         );
 
-        // Try to parse JSON if possible
         const contentType = res.headers.get("content-type") || "";
         const data = contentType.includes("application/json") ? await res.json() : null;
 
         if (!res.ok) {
-            // Common Spotify app case: user not logged in / token missing
             if (res.status === 401) {
-                // setStatus("You’re not logged in. Click “Log in” at the top, then try again.");
-                setStatus("Spotify App Development currently down.");
+                setStatus("You’re not logged in. Click “Log in” at the top, then try again.");
                 return;
             }
-
-            const msg =
-                (data && (data.error || data.message)) ||
-                `Request failed (${res.status})`;
+            const msg = (data && (data.error || data.message)) || `Request failed (${res.status})`;
             setStatus(msg);
             return;
         }
 
         const items = data?.items || [];
+        const scanned = data?.scanned;
 
         if (items.length === 0) {
-            setStatus(`No tracks found for ${timeRange}.`);
+            setStatus(`No tracks found under popularity ≤ ${maxPopularity}. (Scanned ${scanned ?? "?"} tracks)`);
             return;
         }
 
-        setStatus(`Showing top ${items.length} tracks (${timeRange.replace("_", " ")}).`);
+        const shownRange = timeRange.replace("_", " ");
+        setStatus(
+            `Showing ${items.length} tracks (${shownRange}) with popularity ≤ ${maxPopularity}.` +
+            (typeof scanned === "number" ? ` Scanned ${scanned} tracks.` : "")
+        );
 
-        // Build HTML with correct index
         tracksEl.innerHTML = items.map((t, i) => trackCard(t, i)).join("");
     } catch (err) {
         console.error(err);
@@ -117,7 +138,7 @@ async function loadTopTracks() {
 // Button click
 loadBtn.addEventListener("click", loadTopTracks);
 
-// Optional: press Enter while focused in the select to load
+// Enter key on select triggers load
 timeRangeEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter") loadTopTracks();
 });

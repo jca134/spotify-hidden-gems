@@ -29,7 +29,7 @@
     <section class="panel">
         <div class="panel-head">
             <h1 class="title">Your top tracks</h1>
-            <p class="muted">Choose a time range, then load your results.</p>
+            <p class="muted">Choose a time range and a max popularity, then load your results.</p>
         </div>
 
         <div class="controls">
@@ -42,8 +42,40 @@
                 </select>
             </label>
 
+            <label class="field">
+                <span class="field-label">Max popularity</span>
+
+                <div class="popularity-row">
+                    <input
+                            id="popularitySlider"
+                            class="range"
+                            type="range"
+                            min="0"
+                            max="100"
+                            step="1"
+                            value="100"
+                            aria-label="Max popularity slider"
+                    />
+
+                    <input
+                            id="popularityInput"
+                            class="number"
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="1"
+                            value="100"
+                            inputmode="numeric"
+                            aria-label="Max popularity number"
+                    />
+                </div>
+
+                <span class="muted" id="popularityHint">
+          Showing tracks with popularity ≤ <strong>100</strong>
+        </span>
+            </label>
+
             <button class="btn primary" id="loadBtn">Load tracks</button>
-<!--TODO: Add slider for popularity from 1-100-->
         </div>
 
         <div id="status" class="status" role="status" aria-live="polite"></div>
@@ -61,9 +93,11 @@
             <span class="muted">Developed by Jaden Aguilon</span>
         </div>
 
+        <!--
         <p class="footer-note danger">
-            ⚠️ Spotify Developer Platform is currently unavailable — login may not work.
+          ⚠️ Spotify Developer Platform is currently unavailable — login may not work.
         </p>
+        -->
     </div>
 </footer>
 
