@@ -165,41 +165,118 @@ async function refreshAccessToken(req, res) {
     }
 }
 
-// --- API: Top Tracks ---
+// --- API: Top Tracks (scan up to 1000, return top 20 under popularity threshold) ---
 app.get("/api/top-tracks", async (req, res) => {
     const allowedRanges = new Set(["short_term", "medium_term", "long_term"]);
     const rangeParam = typeof req.query.time_range === "string" ? req.query.time_range : "";
     const time_range = allowedRanges.has(rangeParam) ? rangeParam : "short_term";
 
-    const rawLimit = typeof req.query.limit === "string" ? parseInt(req.query.limit, 10) : 20;
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 50) : 20;
+    // User UI sends this as max_popularity (0-100). We only *display* the first 20
+    // tracks under this threshold, but we may need to scan/paginate a lot of top tracks
+    // to find 20 matches.
+    const rawMaxPopularity =
+        typeof req.query.max_popularity === "string" ? parseInt(req.query.max_popularity, 10) : 100;
+    const max_popularity = Number.isFinite(rawMaxPopularity)
+        ? Math.min(Math.max(rawMaxPopularity, 0), 100)
+        : 100;
+
+    // Hard cap: scan at most 1000 of the user's top tracks.
+    // (Spotify uses pagination with limit<=50 and offset.)
+    const MAX_SCAN = 1000;
+    const PAGE_SIZE = 50;
+    const MAX_RETURN = 20;
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
-    const callSpotify = async (token) => {
-        return axios.get("https://api.spotify.com/v1/me/top/tracks", {
-            headers: { Authorization: `Bearer ${token}` },
-            params: { time_range, limit },
+    // Small helper that retries once after refreshing on a 401.
+    const spotifyGet = async (url, params) => {
+        const doReq = (token) =>
+            axios.get(url, {
+                headers: { Authorization: `Bearer ${token}` },
+                params,
+            });
+
+        try {
+            return await doReq(accessToken);
+        } catch (err) {
+            if (err.response?.status === 401) {
+                const newToken = await refreshAccessToken(req, res);
+                if (!newToken) throw err;
+                accessToken = newToken;
+                return await doReq(newToken);
+            }
+            throw err;
+        }
+    };
+
+    // Some Spotify endpoints already include popularity on track objects, but this
+    // fallback guarantees we can show it even if Spotify changes fields.
+    const ensurePopularity = async (tracks) => {
+        const missing = tracks.filter((t) => typeof t?.popularity !== "number" && t?.id);
+        if (missing.length === 0) return tracks;
+
+        const byId = new Map();
+        // Spotify batch /tracks allows up to 50 ids.
+        for (let i = 0; i < missing.length; i += 50) {
+            const chunk = missing.slice(i, i + 50);
+            const ids = chunk.map((t) => t.id).join(",");
+            const r = await spotifyGet("https://api.spotify.com/v1/tracks", { ids });
+            for (const tr of r.data?.tracks || []) {
+                if (tr?.id) byId.set(tr.id, tr);
+            }
+        }
+
+        return tracks.map((t) => {
+            if (typeof t?.popularity === "number") return t;
+            const full = t?.id ? byId.get(t.id) : null;
+            return full ? { ...t, popularity: full.popularity } : t;
         });
     };
 
     try {
-        const apiRes = await callSpotify(accessToken);
-        return res.json(apiRes.data);
-    } catch (err) {
-        if (err.response?.status === 401) {
-            const newToken = await refreshAccessToken(req, res);
-            if (!newToken) {
-                return res
-                    .status(401)
-                    .json({ error: "Session expired. Please log in again." });
+        let offset = 0;
+        let scanned = 0;
+        const matches = [];
+
+        while (scanned < MAX_SCAN && matches.length < MAX_RETURN) {
+            const pageLimit = Math.min(PAGE_SIZE, MAX_SCAN - scanned);
+            const pageRes = await spotifyGet("https://api.spotify.com/v1/me/top/tracks", {
+                time_range,
+                limit: pageLimit,
+                offset,
+            });
+
+            let items = Array.isArray(pageRes.data?.items) ? pageRes.data.items : [];
+            scanned += items.length;
+            offset += items.length;
+
+            // Ensure popularity is present so the frontend can show it.
+            items = await ensurePopularity(items);
+
+            for (const t of items) {
+                // Spotify popularity is 0-100
+                const pop = typeof t?.popularity === "number" ? t.popularity : null;
+                if (pop !== null && pop <= max_popularity) {
+                    matches.push(t);
+                    if (matches.length >= MAX_RETURN) break;
+                }
             }
 
-            const apiRes2 = await callSpotify(newToken);
-            return res.json(apiRes2.data);
+            // No more pages available.
+            if (items.length < pageLimit) break;
         }
 
+        return res.json({
+            items: matches,
+            scanned,
+            max_popularity,
+            time_range,
+        });
+    } catch (err) {
+        if (err.response?.status === 401) {
+            return res.status(401).json({ error: "Session expired. Please log in again." });
+        }
         console.error(err?.response?.data || err.message);
         return res.status(500).json({ error: "Spotify API call failed" });
     }
