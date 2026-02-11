@@ -3,30 +3,63 @@ import axios from "axios"; // Spotify HTTP requests
 import dotenv from "dotenv"; // loads .env to process.env
 import cookieParser from "cookie-parser"; // lets you read cookies
 import crypto from "crypto"; // Secure random and SHA256
-// import path from "path";
-// import { fileURLToPath } from "url";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 const STATE_BYTE_LENGTH = 16;
 const VERIFY_BYTE_LENGTH = 32;
-// Read in secret data from .env
+
 dotenv.config();
 
-// App creation
 const app = express();
-
-// Allows you to request cookie info
 app.use(cookieParser());
-// Simplifies: GET /index.html -> /public/index.html
 app.use(express.static("public"));
 
-// Saving file name and directory of server.js
-// const __filename = fileURLToPath(import.meta.url);
-// const __dirname = path.dirname(__filename);
+// ---- Minimal safe defaults ----
+app.set("trust proxy", 1); // important if behind a proxy (Render/Heroku/Nginx) for secure cookies + req.secure
 
-const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI } = process.env; // Load from process.env
+app.use(
+    helmet({
+        // keep defaults; avoids breaking OAuth redirects
+        crossOriginResourcePolicy: { policy: "cross-origin" }
+    })
+);
+
+// Rate limit auth endpoints to reduce abuse
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60, // 60 requests / 15 min per IP
+    standardHeaders: true,
+    legacyHeaders: false
+});
+
+const isProd = process.env.NODE_ENV === "production";
+
+// Centralized cookie options
+const cookieBaseOpts = {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: isProd // only send over HTTPS in production
+};
+
+// Short-lived cookies for PKCE/state
+const authTempCookieOpts = {
+    ...cookieBaseOpts,
+    maxAge: 10 * 60 * 1000 // 10 minutes
+};
+
+// Access/refresh token cookie lifetimes
+const accessCookieOpts = {
+    ...cookieBaseOpts,
+    maxAge: 60 * 60 * 1000 // 1 hour
+};
+
+const refreshCookieOpts = {
+    ...cookieBaseOpts,
+    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
+};
 
 // URL Format: https://accounts.spotify.com/authorize? + code_challenge=Ab-c_def...
-// Mute complete code_challenge to access
 function base64url(buffer) {
     return buffer
         .toString("base64")
@@ -35,34 +68,24 @@ function base64url(buffer) {
         .replace(/=+$/, "");
 }
 
-// --- Login Authentification + Handshake---
-app.get("/login", async (req, res) => {
-    // PKCE
+// --- LOGIN: Authorization Code Flow + PKCE ---
+app.get("/login", authLimiter, async (req, res) => {
     const state = crypto.randomBytes(STATE_BYTE_LENGTH).toString("hex");
     const codeVerifier = base64url(crypto.randomBytes(VERIFY_BYTE_LENGTH));
     const codeChallenge = base64url(
         crypto.createHash("sha256").update(codeVerifier).digest()
     );
 
-    // Stores to browser cookie and only the server (via HTTP requests)
-    // can access info, not JavaScript
+    // Store state + verifier in short-lived, httpOnly cookies
+    res.cookie("spotify_auth_state", state, authTempCookieOpts);
+    res.cookie("spotify_code_verifier", codeVerifier, authTempCookieOpts);
 
-    const cookieOpts = {
-        httpOnly: true,
-        sameSite: "lax",
-        secure: false // set true when using https in production
-    };
-
-    res.cookie("spotify_auth_state", state, cookieOpts);
-    res.cookie("spotify_code_verifier", codeVerifier, { httpOnly: true });
-
-    // Create req params
-    const scope = "user-top-read"; // Request from Spotify
+    const scope = "user-top-read";
     const params = new URLSearchParams({
-        response_type: "code", // Tells Spotify to return an authorization *code*
-        client_id: SPOTIFY_CLIENT_ID,
+        response_type: "code",
+        client_id: process.env.SPOTIFY_CLIENT_ID,
         scope,
-        redirect_uri: REDIRECT_URI, // Where Spotify sends the user after login
+        redirect_uri: process.env.REDIRECT_URI,
         state,
         code_challenge_method: "S256",
         code_challenge: codeChallenge
@@ -72,27 +95,26 @@ app.get("/login", async (req, res) => {
 });
 
 // --- CALLBACK: exchange code for access token ---
-app.get("/callback", async (req, res) => {
-    // Gets authentification code
-    // Code makes it so data can't be accessed by others
-    // State ensures callback query is the same one sent out
+app.get("/callback", authLimiter, async (req, res) => {
     const { code, state } = req.query;
     const storedState = req.cookies["spotify_auth_state"];
     const codeVerifier = req.cookies["spotify_code_verifier"];
 
-    if (!state || state !== storedState) {
-        return res.status(400).send("State mismatch. Try again.");
+    if (!code || !state || state !== storedState || !codeVerifier) {
+        // Clear temp cookies to avoid weird retry/replay states
+        res.clearCookie("spotify_auth_state", cookieBaseOpts);
+        res.clearCookie("spotify_code_verifier", cookieBaseOpts);
+        return res.status(400).send("Invalid auth session. Try again.");
     }
 
-    // PKCE established. Request for authorization_code
     try {
         const tokenRes = await axios.post(
             "https://accounts.spotify.com/api/token",
             new URLSearchParams({
                 grant_type: "authorization_code",
                 code,
-                redirect_uri: REDIRECT_URI,
-                client_id: SPOTIFY_CLIENT_ID,
+                redirect_uri: process.env.REDIRECT_URI,
+                client_id: process.env.SPOTIFY_CLIENT_ID,
                 code_verifier: codeVerifier
             }),
             {
@@ -102,15 +124,23 @@ app.get("/callback", async (req, res) => {
 
         const { access_token, refresh_token } = tokenRes.data;
 
-        // Store tokens in cookies
-        res.cookie("spotify_access_token", access_token, { httpOnly: true });
+        // Store tokens in httpOnly cookies with reasonable expiration
+        res.cookie("spotify_access_token", access_token, accessCookieOpts);
+
         if (refresh_token) {
-            res.cookie("spotify_refresh_token", refresh_token, { httpOnly: true });
+            res.cookie("spotify_refresh_token", refresh_token, refreshCookieOpts);
         }
+
+        // Clear state/verifier after successful use
+        res.clearCookie("spotify_auth_state", cookieBaseOpts);
+        res.clearCookie("spotify_code_verifier", cookieBaseOpts);
 
         res.redirect("/");
     } catch (err) {
         console.error(err?.response?.data || err.message);
+        // Clear temp cookies on failure too
+        res.clearCookie("spotify_auth_state", cookieBaseOpts);
+        res.clearCookie("spotify_code_verifier", cookieBaseOpts);
         res.status(500).send("Token exchange failed.");
     }
 });
@@ -119,6 +149,8 @@ app.get("/callback", async (req, res) => {
 async function refreshAccessToken(req, res) {
     const refreshToken = req.cookies.spotify_refresh_token;
     if (!refreshToken) return null;
+
+    const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET } = process.env;
 
     const tokenRes = await axios.post(
         "https://accounts.spotify.com/api/token",
@@ -132,17 +164,20 @@ async function refreshAccessToken(req, res) {
     );
 
     const { access_token } = tokenRes.data;
-    res.cookie("spotify_access_token", access_token, { httpOnly: true });
+    res.cookie("spotify_access_token", access_token, accessCookieOpts);
     return access_token;
 }
 
 // --- API: Top Tracks ---
 app.get("/api/top-tracks", async (req, res) => {
-    const time_range = req.query.time_range || "short_term"; // short_term, medium_term, long_term
+    const allowedRanges = new Set(["short_term", "medium_term", "long_term"]);
+    const time_range = allowedRanges.has(req.query.time_range)
+        ? req.query.time_range
+        : "short_term";
+
     const limit = Math.min(parseInt(req.query.limit || "20", 10), 50);
 
     let accessToken = req.cookies["spotify_access_token"];
-
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
     try {
@@ -156,16 +191,15 @@ app.get("/api/top-tracks", async (req, res) => {
             const newToken = await refreshAccessToken(req, res);
 
             if (!newToken) {
-                return res.status(401).json({ error: "Session expired. Please log in again." });
+                return res
+                    .status(401)
+                    .json({ error: "Session expired. Please log in again." });
             }
 
-            const apiRes2 = await axios.get(
-                "https://api.spotify.com/v1/me/top/tracks",
-                {
-                    headers: { Authorization: `Bearer ${newToken}` },
-                    params: { time_range, limit }
-                }
-            );
+            const apiRes2 = await axios.get("https://api.spotify.com/v1/me/top/tracks", {
+                headers: { Authorization: `Bearer ${newToken}` },
+                params: { time_range, limit }
+            });
 
             return res.json(apiRes2.data);
         }
@@ -177,11 +211,12 @@ app.get("/api/top-tracks", async (req, res) => {
 
 // --- LOGOUT ---
 app.get("/logout", (req, res) => {
-    res.clearCookie("spotify_access_token");
-    res.clearCookie("spotify_refresh_token");
-    res.clearCookie("spotify_auth_state");
-    res.clearCookie("spotify_code_verifier");
+    res.clearCookie("spotify_access_token", cookieBaseOpts);
+    res.clearCookie("spotify_refresh_token", cookieBaseOpts);
+    res.clearCookie("spotify_auth_state", cookieBaseOpts);
+    res.clearCookie("spotify_code_verifier", cookieBaseOpts);
     res.redirect("/");
 });
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
