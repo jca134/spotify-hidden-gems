@@ -74,17 +74,16 @@ app.get("/login", authLimiter, async (req, res) => {
     res.cookie("spotify_auth_state", state, authTempCookieOpts);
     res.cookie("spotify_code_verifier", codeVerifier, authTempCookieOpts);
 
+    const scope = "user-top-read";
     const params = new URLSearchParams({
         response_type: "code",
         client_id: process.env.SPOTIFY_CLIENT_ID,
-        scope: "user-top-read",
+        scope,
         redirect_uri: process.env.REDIRECT_URI,
         state,
-        show_dialog: "true",
         code_challenge_method: "S256",
         code_challenge: codeChallenge,
     });
-
 
     res.redirect("https://accounts.spotify.com/authorize?" + params.toString());
 });
