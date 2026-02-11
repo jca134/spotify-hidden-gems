@@ -78,12 +78,14 @@ app.get("/login", authLimiter, async (req, res) => {
     const params = new URLSearchParams({
         response_type: "code",
         client_id: process.env.SPOTIFY_CLIENT_ID,
-        scope,
+        scope: "user-top-read",
         redirect_uri: process.env.REDIRECT_URI,
         state,
+        show_dialog: "true",
         code_challenge_method: "S256",
         code_challenge: codeChallenge,
     });
+
 
     res.redirect("https://accounts.spotify.com/authorize?" + params.toString());
 });
@@ -150,7 +152,6 @@ async function refreshAccessToken(req, res) {
                 grant_type: "refresh_token",
                 refresh_token: refreshToken,
                 client_id: SPOTIFY_CLIENT_ID,
-                // If you are using a confidential client (server-side), keep this:
                 client_secret: SPOTIFY_CLIENT_SECRET,
             }),
             { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
