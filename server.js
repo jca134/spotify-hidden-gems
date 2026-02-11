@@ -11,16 +11,32 @@ const VERIFY_BYTE_LENGTH = 32;
 
 dotenv.config();
 
+const {
+    SPOTIFY_CLIENT_ID,
+    SPOTIFY_CLIENT_SECRET,
+    REDIRECT_URI,
+    NODE_ENV,
+} = process.env;
+
+if (!SPOTIFY_CLIENT_ID) {
+    throw new Error("Missing env var: SPOTIFY_CLIENT_ID");
+}
+if (!SPOTIFY_CLIENT_SECRET) {
+    throw new Error("Missing env var: SPOTIFY_CLIENT_SECRET");
+}
+if (!REDIRECT_URI) {
+    throw new Error("Missing env var: REDIRECT_URI (must exactly match Spotify dashboard Redirect URI)");
+}
+
 const app = express();
 app.use(cookieParser());
 app.use(express.static("public"));
 
-// ---- Minimal safe defaults ----
+// Render / proxies
 app.set("trust proxy", 1);
 
 app.use(
     helmet({
-        // keep defaults; avoids breaking OAuth redirects
         crossOriginResourcePolicy: { policy: "cross-origin" },
     })
 );
@@ -32,28 +48,34 @@ const authLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-const isProd = process.env.NODE_ENV === "production";
+// Detect HTTPS properly behind proxy (Render)
+const isSecureRequest = (req) => {
+    // req.secure works with trust proxy + https upstream
+    if (req.secure) return true;
+    const xfProto = req.get("x-forwarded-proto");
+    return xfProto === "https";
+};
 
-const cookieBaseOpts = {
+const cookieBaseOpts = (req) => ({
     httpOnly: true,
     sameSite: "lax",
-    secure: isProd,
-};
+    secure: isSecureRequest(req), // ✅ important on Render
+});
 
-const authTempCookieOpts = {
-    ...cookieBaseOpts,
+const authTempCookieOpts = (req) => ({
+    ...cookieBaseOpts(req),
     maxAge: 10 * 60 * 1000,
-};
+});
 
-const accessCookieOpts = {
-    ...cookieBaseOpts,
+const accessCookieOpts = (req) => ({
+    ...cookieBaseOpts(req),
     maxAge: 60 * 60 * 1000,
-};
+});
 
-const refreshCookieOpts = {
-    ...cookieBaseOpts,
+const refreshCookieOpts = (req) => ({
+    ...cookieBaseOpts(req),
     maxAge: 30 * 24 * 60 * 60 * 1000,
-};
+});
 
 function base64url(buffer) {
     return buffer
@@ -63,6 +85,20 @@ function base64url(buffer) {
         .replace(/=+$/, "");
 }
 
+// Helpful debug endpoint (remove later if you want)
+app.get("/api/debug-auth", (req, res) => {
+    res.json({
+        redirect_uri: REDIRECT_URI,
+        has_access_cookie: Boolean(req.cookies["spotify_access_token"]),
+        has_refresh_cookie: Boolean(req.cookies["spotify_refresh_token"]),
+        has_state_cookie: Boolean(req.cookies["spotify_auth_state"]),
+        has_verifier_cookie: Boolean(req.cookies["spotify_code_verifier"]),
+        node_env: NODE_ENV,
+        x_forwarded_proto: req.get("x-forwarded-proto") || null,
+        req_secure: req.secure,
+    });
+});
+
 // --- LOGIN: Authorization Code Flow + PKCE ---
 app.get("/login", authLimiter, async (req, res) => {
     const state = crypto.randomBytes(STATE_BYTE_LENGTH).toString("hex");
@@ -71,16 +107,22 @@ app.get("/login", authLimiter, async (req, res) => {
         crypto.createHash("sha256").update(codeVerifier).digest()
     );
 
-    res.cookie("spotify_auth_state", state, authTempCookieOpts);
-    res.cookie("spotify_code_verifier", codeVerifier, authTempCookieOpts);
+    // ✅ cookie opts depend on request HTTPS
+    res.cookie("spotify_auth_state", state, authTempCookieOpts(req));
+    res.cookie("spotify_code_verifier", codeVerifier, authTempCookieOpts(req));
 
     const scope = "user-top-read";
+
     const params = new URLSearchParams({
         response_type: "code",
-        client_id: process.env.SPOTIFY_CLIENT_ID,
+        client_id: SPOTIFY_CLIENT_ID,
         scope,
-        redirect_uri: process.env.REDIRECT_URI,
+        redirect_uri: REDIRECT_URI,
         state,
+
+        // ✅ forces Spotify to re-prompt and actually grant new scopes
+        show_dialog: "true",
+
         code_challenge_method: "S256",
         code_challenge: codeChallenge,
     });
@@ -97,8 +139,8 @@ app.get("/callback", authLimiter, async (req, res) => {
     const codeVerifier = req.cookies["spotify_code_verifier"];
 
     if (!code || !state || state !== storedState || !codeVerifier) {
-        res.clearCookie("spotify_auth_state", cookieBaseOpts);
-        res.clearCookie("spotify_code_verifier", cookieBaseOpts);
+        res.clearCookie("spotify_auth_state", cookieBaseOpts(req));
+        res.clearCookie("spotify_code_verifier", cookieBaseOpts(req));
         return res.status(400).send("Invalid auth session. Try again.");
     }
 
@@ -108,31 +150,29 @@ app.get("/callback", authLimiter, async (req, res) => {
             new URLSearchParams({
                 grant_type: "authorization_code",
                 code,
-                redirect_uri: process.env.REDIRECT_URI,
-                client_id: process.env.SPOTIFY_CLIENT_ID,
+                redirect_uri: REDIRECT_URI,
+                client_id: SPOTIFY_CLIENT_ID,
                 code_verifier: codeVerifier,
             }),
-            {
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            }
+            { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
         );
 
         const { access_token, refresh_token } = tokenRes.data;
 
-        res.cookie("spotify_access_token", access_token, accessCookieOpts);
+        res.cookie("spotify_access_token", access_token, accessCookieOpts(req));
 
         if (refresh_token) {
-            res.cookie("spotify_refresh_token", refresh_token, refreshCookieOpts);
+            res.cookie("spotify_refresh_token", refresh_token, refreshCookieOpts(req));
         }
 
-        res.clearCookie("spotify_auth_state", cookieBaseOpts);
-        res.clearCookie("spotify_code_verifier", cookieBaseOpts);
+        res.clearCookie("spotify_auth_state", cookieBaseOpts(req));
+        res.clearCookie("spotify_code_verifier", cookieBaseOpts(req));
 
         res.redirect("/");
     } catch (err) {
-        console.error(err?.response?.data || err.message);
-        res.clearCookie("spotify_auth_state", cookieBaseOpts);
-        res.clearCookie("spotify_code_verifier", cookieBaseOpts);
+        console.error("Token exchange failed:", err?.response?.data || err.message);
+        res.clearCookie("spotify_auth_state", cookieBaseOpts(req));
+        res.clearCookie("spotify_code_verifier", cookieBaseOpts(req));
         res.status(500).send("Token exchange failed.");
     }
 });
@@ -140,8 +180,6 @@ app.get("/callback", authLimiter, async (req, res) => {
 async function refreshAccessToken(req, res) {
     const refreshToken = req.cookies.spotify_refresh_token;
     if (!refreshToken) return null;
-
-    const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET } = process.env;
 
     try {
         const tokenRes = await axios.post(
@@ -156,7 +194,7 @@ async function refreshAccessToken(req, res) {
         );
 
         const { access_token } = tokenRes.data;
-        res.cookie("spotify_access_token", access_token, accessCookieOpts);
+        res.cookie("spotify_access_token", access_token, accessCookieOpts(req));
         return access_token;
     } catch (err) {
         console.error("Refresh failed:", err?.response?.data || err.message);
@@ -170,25 +208,22 @@ app.get("/api/top-tracks", async (req, res) => {
     const rangeParam = typeof req.query.time_range === "string" ? req.query.time_range : "";
     const time_range = allowedRanges.has(rangeParam) ? rangeParam : "short_term";
 
-    // User UI sends this as max_popularity (0-100). We only *display* the first 20
-    // tracks under this threshold, but we may need to scan/paginate a lot of top tracks
-    // to find 20 matches.
     const rawMaxPopularity =
-        typeof req.query.max_popularity === "string" ? parseInt(req.query.max_popularity, 10) : 100;
+        typeof req.query.max_popularity === "string"
+            ? parseInt(req.query.max_popularity, 10)
+            : 100;
+
     const max_popularity = Number.isFinite(rawMaxPopularity)
         ? Math.min(Math.max(rawMaxPopularity, 0), 100)
         : 100;
 
-    // Hard cap: scan at most 1000 of the user's top tracks.
-    // (Spotify uses pagination with limit<=50 and offset.)
-    const MAX_SCAN = 200;
+    const MAX_SCAN = 1000; // ✅ your requirement
     const PAGE_SIZE = 50;
     const MAX_RETURN = 20;
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
-    // Small helper that retries once after refreshing on a 401.
     const spotifyGet = async (url, params) => {
         const doReq = (token) =>
             axios.get(url, {
@@ -209,14 +244,11 @@ app.get("/api/top-tracks", async (req, res) => {
         }
     };
 
-    // Some Spotify endpoints already include popularity on track objects, but this
-    // fallback guarantees we can show it even if Spotify changes fields.
     const ensurePopularity = async (tracks) => {
         const missing = tracks.filter((t) => typeof t?.popularity !== "number" && t?.id);
         if (missing.length === 0) return tracks;
 
         const byId = new Map();
-        // Spotify batch /tracks allows up to 50 ids.
         for (let i = 0; i < missing.length; i += 50) {
             const chunk = missing.slice(i, i + 50);
             const ids = chunk.map((t) => t.id).join(",");
@@ -250,11 +282,9 @@ app.get("/api/top-tracks", async (req, res) => {
             scanned += items.length;
             offset += items.length;
 
-            // Ensure popularity is present so the frontend can show it.
             items = await ensurePopularity(items);
 
             for (const t of items) {
-                // Spotify popularity is 0-100
                 const pop = typeof t?.popularity === "number" ? t.popularity : null;
                 if (pop !== null && pop <= max_popularity) {
                     matches.push(t);
@@ -262,7 +292,6 @@ app.get("/api/top-tracks", async (req, res) => {
                 }
             }
 
-            // No more pages available.
             if (items.length < pageLimit) break;
         }
 
@@ -275,24 +304,22 @@ app.get("/api/top-tracks", async (req, res) => {
     } catch (err) {
         const status = err?.response?.status;
 
-        // Log useful info to your server console (Render logs etc.)
         console.error("Spotify API error:", {
             status,
             data: err?.response?.data,
             message: err?.message,
         });
 
-        // If Spotify returned an HTTP status, forward it
         if (status) {
             const spotifyMsg =
                 err?.response?.data?.error?.message ||
                 err?.response?.data?.message ||
                 "Spotify API error";
 
-            // Special-case: missing scope is super common
             if (status === 403) {
                 return res.status(403).json({
-                    error: `Spotify rejected this request (403). Usually this means your access token is missing the required scope (user-top-read). Log out, then log in again.`,
+                    error:
+                        "Spotify rejected this request (403). Your token is missing user-top-read. Hit /logout then /login again (or revoke the app in Spotify settings) and retry.",
                     spotify: spotifyMsg,
                 });
             }
@@ -310,7 +337,6 @@ app.get("/api/top-tracks", async (req, res) => {
             });
         }
 
-        // Non-HTTP (network, DNS, etc.)
         return res.status(500).json({
             error: "Server error contacting Spotify",
             details: err?.message,
@@ -320,12 +346,12 @@ app.get("/api/top-tracks", async (req, res) => {
 
 // --- LOGOUT ---
 app.get("/logout", (req, res) => {
-    res.clearCookie("spotify_access_token", cookieBaseOpts);
-    res.clearCookie("spotify_refresh_token", cookieBaseOpts);
-    res.clearCookie("spotify_auth_state", cookieBaseOpts);
-    res.clearCookie("spotify_code_verifier", cookieBaseOpts);
+    res.clearCookie("spotify_access_token", cookieBaseOpts(req));
+    res.clearCookie("spotify_refresh_token", cookieBaseOpts(req));
+    res.clearCookie("spotify_auth_state", cookieBaseOpts(req));
+    res.clearCookie("spotify_code_verifier", cookieBaseOpts(req));
     res.redirect("/");
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`)); // ✅ fixed
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
