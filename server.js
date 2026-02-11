@@ -182,7 +182,7 @@ app.get("/api/top-tracks", async (req, res) => {
 
     // Hard cap: scan at most 1000 of the user's top tracks.
     // (Spotify uses pagination with limit<=50 and offset.)
-    const MAX_SCAN = 500;
+    const MAX_SCAN = 200;
     const PAGE_SIZE = 50;
     const MAX_RETURN = 20;
 
@@ -274,11 +274,48 @@ app.get("/api/top-tracks", async (req, res) => {
             time_range,
         });
     } catch (err) {
-        if (err.response?.status === 401) {
-            return res.status(401).json({ error: "Session expired. Please log in again." });
+        const status = err?.response?.status;
+
+        // Log useful info to your server console (Render logs etc.)
+        console.error("Spotify API error:", {
+            status,
+            data: err?.response?.data,
+            message: err?.message,
+        });
+
+        // If Spotify returned an HTTP status, forward it
+        if (status) {
+            const spotifyMsg =
+                err?.response?.data?.error?.message ||
+                err?.response?.data?.message ||
+                "Spotify API error";
+
+            // Special-case: missing scope is super common
+            if (status === 403) {
+                return res.status(403).json({
+                    error: `Spotify rejected this request (403). Usually this means your access token is missing the required scope (user-top-read). Log out, then log in again.`,
+                    spotify: spotifyMsg,
+                });
+            }
+
+            if (status === 429) {
+                return res.status(429).json({
+                    error: "Rate limited by Spotify (429). Try again in a few seconds.",
+                    spotify: spotifyMsg,
+                });
+            }
+
+            return res.status(status).json({
+                error: spotifyMsg,
+                spotify: err?.response?.data,
+            });
         }
-        console.error(err?.response?.data || err.message);
-        return res.status(500).json({ error: "Spotify API call failed" });
+
+        // Non-HTTP (network, DNS, etc.)
+        return res.status(500).json({
+            error: "Server error contacting Spotify",
+            details: err?.message,
+        });
     }
 });
 
