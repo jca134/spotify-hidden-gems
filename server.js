@@ -74,7 +74,6 @@ app.get("/login", authLimiter, async (req, res) => {
     res.cookie("spotify_auth_state", state, authTempCookieOpts);
     res.cookie("spotify_code_verifier", codeVerifier, authTempCookieOpts);
 
-    const scope = "user-top-read";
     const params = new URLSearchParams({
         response_type: "code",
         client_id: process.env.SPOTIFY_CLIENT_ID,
