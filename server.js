@@ -182,7 +182,7 @@ app.get("/api/top-tracks", async (req, res) => {
 
     // Hard cap: scan at most 1000 of the user's top tracks.
     // (Spotify uses pagination with limit<=50 and offset.)
-    const MAX_SCAN = 1000;
+    const MAX_SCAN = 500;
     const PAGE_SIZE = 50;
     const MAX_RETURN = 20;
 
