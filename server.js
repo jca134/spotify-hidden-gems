@@ -294,7 +294,7 @@ app.get("/api/top-tracks", async (req, res) => {
 
         // Otherwise: page through results and filter until we have `limit`
         const pageSize = 50;
-        const maxScanned = 200; // safety cap
+        const maxScanned = 100; // safety cap
 
         let offset = 0;
         let scanned = 0;
