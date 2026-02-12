@@ -297,16 +297,16 @@ app.get("/api/top-tracks", async (req, res) => {
             return { ...apiRes.data, scanned: apiRes.data?.items?.length ?? 0 };
         }
 
-        // Otherwise: page through results and filter.
+        // Otherwise: page through results and filter until we have `limit`
         const pageSize = 50;
-        const maxScanned = 500; // safety cap
+        const maxScanned = 200; // safety cap
 
         let offset = 0;
         let scanned = 0;
         const kept = [];
         let total = null;
 
-        while (kept.length < limit && scanned < maxScanned) {
+        while (scanned < maxScanned) {
             const apiRes = await callSpotify(token, {
                 time_range,
                 limit: pageSize,
@@ -321,15 +321,29 @@ app.get("/api/top-tracks", async (req, res) => {
             for (const t of items) {
                 if (typeof t?.popularity === "number" && t.popularity <= maxPopularity) {
                     kept.push(t);
-                    if (kept.length >= limit) break;
+
+                    if (kept.length >= limit) {
+                        return {
+                            items: kept.slice(0, limit),
+                            scanned,
+                            total,
+                            time_range,
+                            max_popularity: maxPopularity,
+                        };
+                    }
                 }
             }
 
-            if (items.length < pageSize) break; // no more pages
+            // No more data returned → done
+            if (items.length < pageSize) break;
+
             offset += pageSize;
+
+            // If Spotify told us total and we reached it → done
             if (typeof total === "number" && offset >= total) break;
         }
 
+        // If we exit because maxScanned reached or no more results
         return {
             items: kept,
             scanned,
@@ -338,6 +352,7 @@ app.get("/api/top-tracks", async (req, res) => {
             max_popularity: maxPopularity,
         };
     };
+
 
     try {
         const payload = await run(accessToken);
