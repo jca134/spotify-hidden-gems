@@ -11,3 +11,4 @@
 # Secret Data
 .env
 node_modules/
+README.md
