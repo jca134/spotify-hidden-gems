@@ -15,12 +15,6 @@ function escapeHtml(str) {
     });
 }
 
-function clampInt(n, min, max, fallback) {
-    const x = parseInt(String(n), 10);
-    if (Number.isNaN(x)) return fallback;
-    return Math.max(min, Math.min(max, x));
-}
-
 function setStatus(msg) {
     statusEl.textContent = msg || "";
 }
@@ -30,29 +24,27 @@ function setLoading(isLoading) {
     loadBtn.textContent = isLoading ? "Loading..." : "Load tracks";
 }
 
-// Keep slider + number input synced
+// Keep slider + number input synced (no clamping in JS)
 function setPopularityUI(val) {
-    popularitySliderEl.value = String(val);
-    popularityInputEl.value = String(val);
-    popularityHintEl.innerHTML = `Showing tracks with popularity ≤ <strong>${val}</strong>`;
+    const v = String(val ?? "");
+    popularitySliderEl.value = v;
+    popularityInputEl.value = v;
+    popularityHintEl.innerHTML = `Showing tracks with popularity ≤ <strong>${escapeHtml(v)}</strong>`;
 }
 
-// init
-setPopularityUI(clampInt(popularitySliderEl.value, 0, 100, 100));
+// init: default to 100 if empty
+setPopularityUI(popularitySliderEl.value || popularityInputEl.value || 100);
 
 popularitySliderEl.addEventListener("input", () => {
-    setPopularityUI(clampInt(popularitySliderEl.value, 0, 100, 100));
+    setPopularityUI(popularitySliderEl.value);
 });
 
 popularityInputEl.addEventListener("input", () => {
-    setPopularityUI(clampInt(popularityInputEl.value, 0, 100, 100));
+    setPopularityUI(popularityInputEl.value);
 });
 
 function trackCard(track, i) {
-    const img =
-        track?.album?.images?.[1]?.url ||
-        track?.album?.images?.[0]?.url ||
-        "";
+    const img = track?.album?.images?.[1]?.url || track?.album?.images?.[0]?.url || "";
 
     const title = escapeHtml(track?.name ?? "Unknown track");
     const artists = escapeHtml((track?.artists ?? []).map((a) => a.name).join(", ") || "Unknown artist");
@@ -92,10 +84,14 @@ async function loadTopTracks() {
         tracksEl.innerHTML = "";
 
         const timeRange = timeRangeEl.value;
-        const maxPopularity = clampInt(popularitySliderEl.value, 0, 100, 100);
+
+        // No clampInt: rely on HTML min/max, but still convert to a number
+        const maxPopularity = Number(popularityInputEl.value);
 
         const res = await fetch(
-            `/api/top-tracks?time_range=${encodeURIComponent(timeRange)}&max_popularity=${encodeURIComponent(maxPopularity)}`,
+            `/api/top-tracks?time_range=${encodeURIComponent(timeRange)}&max_popularity=${encodeURIComponent(
+                maxPopularity
+            )}`,
             { headers: { Accept: "application/json" } }
         );
 

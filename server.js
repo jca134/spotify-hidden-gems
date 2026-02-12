@@ -265,11 +265,6 @@ async function refreshAccessToken(req, res) {
     }
 }
 
-function clampInt(v, min, max, fallback) {
-    const n = parseInt(String(v), 10);
-    if (!Number.isFinite(n)) return fallback;
-    return Math.max(min, Math.min(max, n));
-}
 
 // ---- API: Top Tracks (supports popularity filter + paging) ----
 app.get("/api/top-tracks", async (req, res) => {
@@ -277,8 +272,8 @@ app.get("/api/top-tracks", async (req, res) => {
     const rangeParam = typeof req.query.time_range === "string" ? req.query.time_range : "";
     const time_range = allowedRanges.has(rangeParam) ? rangeParam : "short_term";
 
-    const limit = clampInt(req.query.limit, 1, 50, 20);
-    const maxPopularity = clampInt(req.query.max_popularity, 0, 100, 100);
+    const limit = 20;
+    const maxPopularity = Number(req.query.max_popularity);
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
