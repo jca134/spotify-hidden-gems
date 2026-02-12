@@ -21,6 +21,16 @@ function msToSecondsCeil(ms) {
     return Math.max(0, Math.ceil(ms / 1000));
 }
 
+function formatCountdown(totalSeconds) {
+    const s = Math.max(0, Math.floor(totalSeconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+
+    if (h > 0) return `${h}h ${m}m ${sec}s`;
+    return `${m}m ${sec}s`;
+}
+
 // ---- Config ----
 const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI, NODE_ENV } = process.env;
 
@@ -270,12 +280,12 @@ app.get("/api/top-tracks", async (req, res) => {
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
-    // If we've recently been rate-limited for this token, tell the user how long remains
+    // If we've recently been rate-limited for this token, tell the user EXACT time remaining
     const cooldownUntil = spotifyCooldownUntilByToken.get(accessToken);
     if (cooldownUntil && Date.now() < cooldownUntil) {
         const remainingSeconds = msToSecondsCeil(cooldownUntil - Date.now());
         return res.status(429).json({
-            error: "Spotify rate limited this server. Please wait before retrying.",
+            error: `Rate limited. Try again in ${formatCountdown(remainingSeconds)}.`,
             retry_after_seconds: remainingSeconds,
             wait_until: new Date(cooldownUntil).toISOString(),
         });
@@ -384,7 +394,7 @@ app.get("/api/top-tracks", async (req, res) => {
             });
         }
 
-        // Rate limit (429): return exact time remaining
+        // Rate limit (429): return formatted countdown + store cooldown
         if (status === 429) {
             const retryAfterSeconds = parseRetryAfterSeconds(err);
 
@@ -393,14 +403,14 @@ app.get("/api/top-tracks", async (req, res) => {
                 spotifyCooldownUntilByToken.set(accessToken, until);
 
                 return res.status(429).json({
-                    error: `Spotify rate limited this server. Wait ${retryAfterSeconds} seconds, then try again.`,
+                    error: `Rate limited. Try again in ${formatCountdown(retryAfterSeconds)}.`,
                     retry_after_seconds: retryAfterSeconds,
                     wait_until: new Date(until).toISOString(),
                 });
             }
 
             return res.status(429).json({
-                error: "Spotify rate limited this server. Please wait a bit and try again.",
+                error: "Rate limited. Please wait a bit and try again.",
                 retry_after_seconds: null,
                 wait_until: null,
             });
