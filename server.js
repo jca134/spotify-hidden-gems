@@ -305,9 +305,10 @@ app.get("/api/top-tracks", async (req, res) => {
             return { ...apiRes.data, scanned: apiRes.data?.items?.length ?? 0 };
         }
 
-        // Otherwise: page through results and filter until we have `limit`
+        // Otherwise: page through results and filter until we have `limit`.
+        // IMPORTANT: We never request more than 100 tracks total from Spotify per button click.
         const pageSize = 50;
-        const maxScanned = 100; // safety cap
+        const maxScanned = 100; // hard safety cap (tracks requested + scanned)
 
         let offset = 0;
         let scanned = 0;
@@ -315,9 +316,16 @@ app.get("/api/top-tracks", async (req, res) => {
         let total = null;
 
         while (scanned < maxScanned && kept.length < limit) {
+            // Clamp the *request size* so the total number of tracks requested from Spotify
+            // across pagination is at most `maxScanned`.
+            const remaining = maxScanned - scanned;
+            if (remaining <= 0) break;
+
+            const requestLimit = Math.min(pageSize, remaining);
+
             const apiRes = await callSpotify(token, {
                 time_range,
-                limit: pageSize,
+                limit: requestLimit,
                 offset,
             });
 
@@ -334,9 +342,9 @@ app.get("/api/top-tracks", async (req, res) => {
             }
 
             // No more data returned → done
-            if (items.length < pageSize) break;
+            if (items.length < requestLimit) break;
 
-            offset += pageSize;
+            offset += requestLimit;
 
             // If Spotify told us total and we reached it → done
             if (typeof total === "number" && offset >= total) break;
