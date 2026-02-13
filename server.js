@@ -11,6 +11,24 @@ dotenv.config();
 // ---- Track Spotify rate-limit cooldown so we can report "time remaining" ----
 const spotifyCooldownUntilByToken = new Map(); // accessToken -> epochMs
 
+// ---- Small in-memory cache so changing the popularity slider doesn't hammer Spotify ----
+// Keyed by refresh token (stable) or access token (fallback) + time_range.
+// TTL is intentionally short: Spotify "top tracks" can drift and we don't want stale UI.
+const TOP_TRACKS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const topTracksCache = new Map(); // cacheKey -> { ts: number, tracks: Array }
+
+function clampInt(n, lo, hi, fallback) {
+    const x = Number(n);
+    if (!Number.isFinite(x)) return fallback;
+    return Math.min(hi, Math.max(lo, Math.trunc(x)));
+}
+
+function getCacheKey(req, time_range) {
+    const refresh = req.cookies["spotify_refresh_token"];
+    const access = req.cookies["spotify_access_token"];
+    return `${refresh || access || "anon"}:${time_range}`;
+}
+
 function parseRetryAfterSeconds(err) {
     const raw = err?.response?.headers?.["retry-after"];
     const n = Number(raw);
@@ -60,6 +78,14 @@ app.use(
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// Keep API calls sane (prevents accidental button spam from slamming Spotify)
+const apiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
     standardHeaders: true,
     legacyHeaders: false,
 });
@@ -266,118 +292,124 @@ async function refreshAccessToken(req, res) {
     }
 }
 
-// ---- API: Top Tracks (popularity filter + hard cap of 100 scanned) ----
-app.get("/api/top-tracks", async (req, res) => {
+// ---- Spotify API helpers ----
+async function fetchUserTopTracks(token, { time_range, maxTracks }) {
+    // Spotify max page size is 50
+    const pageSize = 50;
+    let offset = 0;
+    const out = [];
+
+    while (out.length < maxTracks) {
+        const limit = Math.min(pageSize, maxTracks - out.length);
+        const apiRes = await axios.get("https://api.spotify.com/v1/me/top/tracks", {
+            headers: { Authorization: `Bearer ${token}` },
+            params: { time_range, limit, offset },
+        });
+
+        const items = apiRes.data?.items || [];
+        out.push(...items);
+
+        // End conditions
+        if (items.length < limit) break;
+        offset += limit;
+        const total = typeof apiRes.data?.total === "number" ? apiRes.data.total : null;
+        if (typeof total === "number" && offset >= total) break;
+    }
+
+    return out;
+}
+
+async function fetchTracksByIds(token, ids) {
+    // /v1/tracks supports up to 50 IDs per request
+    const byId = new Map();
+    for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        const apiRes = await axios.get("https://api.spotify.com/v1/tracks", {
+            headers: { Authorization: `Bearer ${token}` },
+            params: { ids: chunk.join(",") },
+        });
+
+        const tracks = apiRes.data?.tracks || [];
+        for (const t of tracks) {
+            if (t?.id) byId.set(t.id, t);
+        }
+    }
+    return byId;
+}
+
+// ---- API: Top Tracks (popularity filter that actually works) ----
+// Why this exists: some Spotify endpoints return *simplified* track objects that do NOT include `popularity`.
+// So we (1) fetch up to 100 top-track IDs, (2) look those IDs up via /v1/tracks to get real popularity,
+// (3) filter in top-rank order, returning the first 20 under the user’s threshold.
+app.get("/api/top-tracks", apiLimiter, async (req, res) => {
     const allowedRanges = new Set(["short_term", "medium_term", "long_term"]);
     const rangeParam = typeof req.query.time_range === "string" ? req.query.time_range : "";
     const time_range = allowedRanges.has(rangeParam) ? rangeParam : "short_term";
 
+    const maxPopularity = clampInt(req.query.max_popularity, 0, 100, 100);
     const limit = 20;
-
-    // Parse + clamp popularity defensively.
-    const rawMax = typeof req.query.max_popularity === "string" ? req.query.max_popularity : "100";
-    let maxPopularity = Number(rawMax);
-    if (!Number.isFinite(maxPopularity)) maxPopularity = 100;
-    maxPopularity = Math.max(0, Math.min(100, Math.round(maxPopularity)));
+    const maxScanned = 100; // hard cap: we will never pull more than 100 of the user’s top tracks per click
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
 
-    // If we've recently been rate-limited for this token, tell the user EXACT time remaining
-    const cooldownUntil = spotifyCooldownUntilByToken.get(accessToken);
-    if (cooldownUntil && Date.now() < cooldownUntil) {
-        const remainingSeconds = msToSecondsCeil(cooldownUntil - Date.now());
-        return res.status(429).json({
-            error: `Rate limited. Try again in ${formatCountdown(remainingSeconds)}.`,
-            retry_after_seconds: remainingSeconds,
-            wait_until: new Date(cooldownUntil).toISOString(),
-        });
-    }
-
-    const callTopTracks = async (token, params) => {
-        return axios.get("https://api.spotify.com/v1/me/top/tracks", {
-            headers: { Authorization: `Bearer ${token}` },
-            params,
-        });
-    };
-
-    // Fetch full track objects (incl. popularity) in batches.
-    // This makes the app robust even if some responses return a simplified
-    // track object without the popularity field.
-    const callTracksByIds = async (token, ids) => {
-        return axios.get("https://api.spotify.com/v1/tracks", {
-            headers: { Authorization: `Bearer ${token}` },
-            params: { ids: ids.join(",") },
-        });
-    };
+    const cacheKey = getCacheKey(req, time_range);
+    const cached = topTracksCache.get(cacheKey);
+    const cacheFresh = cached && Date.now() - cached.ts < TOP_TRACKS_CACHE_TTL_MS;
 
     const run = async (token) => {
-        const pageSize = 50;
-        const maxScanned = 100; // hard safety cap
+        let tracksFull;
+        let cache_used = false;
 
-        // 1) Pull up to maxScanned top tracks (order = Spotify's ranking)
-        let offset = 0;
-        let scanned = 0;
-        let total = null;
-        const topItems = [];
-
-        while (scanned < maxScanned) {
-            const remaining = maxScanned - scanned;
-            const requestLimit = Math.min(pageSize, remaining);
-            if (requestLimit <= 0) break;
-
-            const apiRes = await callTopTracks(token, {
-                time_range,
-                limit: requestLimit,
-                offset,
-            });
-
-            const items = apiRes.data?.items || [];
-            total = typeof apiRes.data?.total === "number" ? apiRes.data.total : total;
-
-            scanned += items.length;
-            topItems.push(...items);
-
-            if (items.length < requestLimit) break; // no more pages
-            offset += requestLimit;
-            if (typeof total === "number" && offset >= total) break;
-        }
-
-        // 2) Hydrate via /v1/tracks to guarantee popularity is present
-        const ids = topItems.map((t) => t?.id).filter(Boolean);
-        const idToFull = new Map();
-
-        for (let i = 0; i < ids.length; i += 50) {
-            const batch = ids.slice(i, i + 50);
-            const detailRes = await callTracksByIds(token, batch);
-            const tracks = detailRes.data?.tracks || [];
-            for (const tr of tracks) {
-                if (tr?.id) idToFull.set(tr.id, tr);
+        // 1) Cache hit → no Spotify calls needed
+        if (cacheFresh) {
+            tracksFull = cached.tracks;
+            cache_used = true;
+        } else {
+            // 2) Cache miss → we WILL call Spotify, so enforce cooldown if rate-limited
+            const cooldownUntil = spotifyCooldownUntilByToken.get(token);
+            if (cooldownUntil && Date.now() < cooldownUntil) {
+                const remainingSeconds = msToSecondsCeil(cooldownUntil - Date.now());
+                const e = new Error("cooldown");
+                e._cooldownSeconds = remainingSeconds;
+                e._cooldownUntil = cooldownUntil;
+                throw e;
             }
+
+            // Fetch up to 100 top tracks (may be simplified)
+            const topItems = await fetchUserTopTracks(token, { time_range, maxTracks: maxScanned });
+            const ids = topItems.map((t) => t?.id).filter(Boolean);
+
+            // Look up those IDs to get FULL track objects (includes `popularity`)
+            const byId = await fetchTracksByIds(token, ids);
+
+            // Preserve the user’s top-track order
+            tracksFull = topItems
+                .map((t) => (t?.id ? byId.get(t.id) : null) || t)
+                .filter(Boolean);
+
+            topTracksCache.set(cacheKey, { ts: Date.now(), tracks: tracksFull });
         }
 
-        const hydrated = topItems.map((t) => {
-            const full = t?.id ? idToFull.get(t.id) : null;
-            return full || t;
-        });
+        const missingPopularity = tracksFull.filter((t) => typeof t?.popularity !== "number").length;
 
-        // 3) Filter and take top 20 under the popularity threshold.
-        const kept = [];
-        for (const t of hydrated) {
-            if (maxPopularity >= 100) {
-                kept.push(t);
-            } else if (typeof t?.popularity === "number" && t.popularity <= maxPopularity) {
-                kept.push(t);
-            }
-            if (kept.length >= limit) break;
-        }
+        // Keep original rank order, just filter by popularity and take first 20
+        const filtered = tracksFull.filter((t) => typeof t?.popularity === "number" && t.popularity <= maxPopularity);
+
+        // If maxPopularity is 100, we still want to show *something* even if popularity is missing.
+        // (With /v1/tracks enrichment, missingPopularity should be 0.)
+        const items =
+            maxPopularity >= 100
+                ? tracksFull.slice(0, limit)
+                : filtered.slice(0, limit);
 
         return {
-            items: kept.slice(0, limit),
-            scanned,
-            total,
+            items,
+            scanned: tracksFull.length,
             time_range,
             max_popularity: maxPopularity,
+            missing_popularity: missingPopularity,
+            cache_used,
         };
     };
 
@@ -385,6 +417,15 @@ app.get("/api/top-tracks", async (req, res) => {
         const payload = await run(accessToken);
         return res.json(payload);
     } catch (err) {
+        // Our manual cooldown throw
+        if (err?._cooldownSeconds != null) {
+            return res.status(429).json({
+                error: `Rate limited. Try again in ${formatCountdown(err._cooldownSeconds)}.`,
+                retry_after_seconds: err._cooldownSeconds,
+                wait_until: new Date(err._cooldownUntil).toISOString(),
+            });
+        }
+
         const status = err?.response?.status;
 
         // Token expired or revoked
@@ -392,15 +433,52 @@ app.get("/api/top-tracks", async (req, res) => {
             const newToken = await refreshAccessToken(req, res);
             if (!newToken) {
                 clearAuthCookies(res);
-                return res.status(401).json({
-                    error: "Session expired. Click Log in and try again.",
-                });
+                return res.status(401).json({ error: "Session expired. Click Log in and try again." });
             }
 
             try {
                 const payload = await run(newToken);
                 return res.json(payload);
             } catch (err2) {
+                const status2 = err2?.response?.status;
+
+                // If we got rate limited right after refresh, return the same friendly countdown
+                if (status2 === 429) {
+                    const retryAfterSeconds = parseRetryAfterSeconds(err2);
+                    if (retryAfterSeconds) {
+                        const until = Date.now() + retryAfterSeconds * 1000;
+                        spotifyCooldownUntilByToken.set(newToken, until);
+                        return res.status(429).json({
+                            error: `Rate limited. Try again in ${formatCountdown(retryAfterSeconds)}.`,
+                            retry_after_seconds: retryAfterSeconds,
+                            wait_until: new Date(until).toISOString(),
+                        });
+                    }
+                    return res.status(429).json({
+                        error: "Rate limited. Please wait a bit and try again.",
+                        retry_after_seconds: null,
+                        wait_until: null,
+                    });
+                }
+
+                // If scope is missing after refresh, send the usual scope hint
+                if (status2 === 403) {
+                    const spotifyMsg = err2?.response?.data?.error?.message;
+                    const grantedScope = req.cookies["spotify_scope"];
+                    const hint =
+                        "Spotify rejected this request (403). Your token is missing user-top-read. " +
+                        "Go to /logout then /login again (consent screen will re-appear). " +
+                        "If it still fails, confirm you’re logging in with the same Spotify account and the same app client_id.";
+
+                    return res.status(403).json({
+                        error: hint,
+                        spotify_message: spotifyMsg,
+                        expected_scopes: REQUIRED_SCOPES,
+                        requested_scopes: SPOTIFY_SCOPES,
+                        token_scopes_seen: grantedScope || null,
+                    });
+                }
+
                 console.error(err2?.response?.data || err2.message);
                 return res.status(500).json({ error: "Spotify API call failed after refresh" });
             }
