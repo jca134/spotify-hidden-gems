@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -12,11 +13,10 @@ dotenv.config();
 const spotifyCooldownUntilByToken = new Map(); // accessToken -> epochMs
 
 // ---- Small in-memory cache so changing the popularity slider doesn't hammer Spotify ----
-// Keyed by refresh token (stable) or access token (fallback) + time_range.
-// TTL is intentionally short: Spotify "top tracks" can drift and we don't want stale UI.
 const TOP_TRACKS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const topTracksCache = new Map(); // cacheKey -> { ts: number, tracks: Array }
 
+// ---- Helpers ----
 function clampInt(n, lo, hi, fallback) {
     const x = Number(n);
     if (!Number.isFinite(x)) return fallback;
@@ -49,39 +49,64 @@ function formatCountdown(totalSeconds) {
     return `${m}m ${sec}s`;
 }
 
+// IMPORTANT: This is the improved 403 message generator.
+// Your /api/session shows the scope is fine, so 403 is usually dev-mode allowlist / quota mode / user access.
+function friendly403(spotifyMsg, req) {
+    const msg = spotifyMsg || "Forbidden";
+    const looksLikeDevUserIssue =
+        /user not (registered|approved)|developer dashboard|allowlist|access denied|insufficient client scope|forbidden/i.test(
+            msg
+        );
+
+    const suffix = req?.cookies?.spotify_scope ? ` (token scopes seen: "${req.cookies.spotify_scope}")` : "";
+
+    if (looksLikeDevUserIssue) {
+        return (
+            `Spotify returned 403: "${msg}". Your scopes look OK${suffix}. ` +
+            `This is commonly caused by Spotify app quota/dev mode restrictions: ` +
+            `Developer Dashboard → your app → Users and Access (User Management) → add your Spotify account email. ` +
+            `Then remove the app under Spotify Account → Authorized apps, and /login again.`
+        );
+    }
+
+    return (
+        `Spotify returned 403: "${msg}". Your scopes look OK${suffix}. ` +
+        `Try removing the app under Spotify Account → Authorized apps, then /login again. ` +
+        `Also verify you're logging into the same Spotify account and using the same app client_id.`
+    );
+}
+
 // ---- Config ----
 const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI, NODE_ENV } = process.env;
 
 const isProd = NODE_ENV === "production";
 const hasClientSecret = Boolean(SPOTIFY_CLIENT_SECRET);
 
-// Spotify requires scopes to be space-separated.
-// IMPORTANT: If you set SPOTIFY_SCOPES in Render/env, it can accidentally *override* required scopes.
-// So we always merge REQUIRED_SCOPES into whatever the env provides.
-const REQUIRED_SCOPES = ["user-top-read"]; // needed for /v1/me/top/tracks
+// We always require user-top-read for /v1/me/top/tracks
+const REQUIRED_SCOPES = ["user-top-read"];
 
+// Merge required scopes with optional env scopes so env can't accidentally remove required scope.
 const envScopesRaw = (process.env.SPOTIFY_SCOPES || "").trim();
-// Accept either space-separated or comma-separated lists from env.
 const envScopes = envScopesRaw.length ? envScopesRaw.split(/[\s,]+/).filter(Boolean) : [];
 const scopeSet = new Set([...envScopes, ...REQUIRED_SCOPES]);
 const SPOTIFY_SCOPES = Array.from(scopeSet).join(" ");
 
-// PKCE is only needed when you *don't* have a client secret (public client).
+// PKCE only needed when you *don't* have a client secret.
 const USE_PKCE = !hasClientSecret;
 
 // ---- App ----
 const app = express();
-app.set("trust proxy", 1); // important on Render / reverse proxies
+app.set("trust proxy", 1);
 app.use(cookieParser());
 app.use(express.static("public"));
 
 app.use(
     helmet({
-        // keep defaults; avoids breaking OAuth redirects
         crossOriginResourcePolicy: { policy: "cross-origin" },
     })
 );
 
+// Rate limit auth endpoints to reduce abuse
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 60,
@@ -89,7 +114,7 @@ const authLimiter = rateLimit({
     legacyHeaders: false,
 });
 
-// Keep API calls sane (prevents accidental button spam from slamming Spotify)
+// Limit API calls to avoid hammering Spotify
 const apiLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 30,
@@ -121,8 +146,7 @@ const refreshCookieOpts = {
 };
 
 function clearAuthCookies(res) {
-    // Clearing cookies can be finicky if you ever changed Secure / SameSite.
-    // So we clear using both secure=true and secure=false variants.
+    // Clear both secure and non-secure variants to prevent “sticky” cookies after changing NODE_ENV
     const variants = [
         { ...cookieBaseOpts, secure: true },
         { ...cookieBaseOpts, secure: false },
@@ -137,7 +161,6 @@ function clearAuthCookies(res) {
     }
 }
 
-// ---- Helpers ----
 const STATE_BYTE_LENGTH = 16;
 const VERIFY_BYTE_LENGTH = 32;
 
@@ -160,7 +183,7 @@ app.get("/login", authLimiter, (req, res) => {
         return res.status(500).send("Server misconfigured: set SPOTIFY_CLIENT_ID and REDIRECT_URI.");
     }
 
-    // Always blow away any old cookies first so you can't get stuck using an old token.
+    // blow away old cookies so you don’t get stuck with stale tokens
     clearAuthCookies(res);
 
     const state = crypto.randomBytes(STATE_BYTE_LENGTH).toString("hex");
@@ -172,8 +195,7 @@ app.get("/login", authLimiter, (req, res) => {
         scope: SPOTIFY_SCOPES,
         redirect_uri: REDIRECT_URI,
         state,
-        // Forces Spotify to show the consent dialog (helps when scopes changed).
-        show_dialog: "true",
+        show_dialog: "true", // force consent screen (helps when scopes changed)
     });
 
     if (USE_PKCE) {
@@ -243,12 +265,11 @@ app.get("/callback", authLimiter, async (req, res) => {
         if (refresh_token) res.cookie("spotify_refresh_token", refresh_token, refreshCookieOpts);
         if (scope) res.cookie("spotify_scope", scope, refreshCookieOpts);
 
-        // Clear one-time cookies
+        // clear one-time cookies
         res.clearCookie("spotify_auth_state", cookieBaseOpts);
         res.clearCookie("spotify_code_verifier", cookieBaseOpts);
 
         console.log("Spotify token granted scopes:", scope || "(none in response)");
-
         res.redirect("/");
     } catch (err) {
         console.error("Token exchange failed:", err?.response?.data || err.message);
@@ -290,8 +311,11 @@ async function refreshAccessToken(req, res) {
             );
         }
 
-        const { access_token } = tokenRes.data;
+        const { access_token, scope } = tokenRes.data;
+
         res.cookie("spotify_access_token", access_token, accessCookieOpts);
+        if (scope) res.cookie("spotify_scope", scope, refreshCookieOpts);
+
         return access_token;
     } catch (err) {
         console.error("Refresh failed:", err?.response?.data || err.message);
@@ -301,13 +325,13 @@ async function refreshAccessToken(req, res) {
 
 // ---- Spotify API helpers ----
 async function fetchUserTopTracks(token, { time_range, maxTracks }) {
-    // Spotify max page size is 50
     const pageSize = 50;
     let offset = 0;
     const out = [];
 
     while (out.length < maxTracks) {
         const limit = Math.min(pageSize, maxTracks - out.length);
+
         const apiRes = await axios.get("https://api.spotify.com/v1/me/top/tracks", {
             headers: { Authorization: `Bearer ${token}` },
             params: { time_range, limit, offset },
@@ -316,9 +340,9 @@ async function fetchUserTopTracks(token, { time_range, maxTracks }) {
         const items = apiRes.data?.items || [];
         out.push(...items);
 
-        // End conditions
         if (items.length < limit) break;
         offset += limit;
+
         const total = typeof apiRes.data?.total === "number" ? apiRes.data.total : null;
         if (typeof total === "number" && offset >= total) break;
     }
@@ -327,10 +351,11 @@ async function fetchUserTopTracks(token, { time_range, maxTracks }) {
 }
 
 async function fetchTracksByIds(token, ids) {
-    // /v1/tracks supports up to 50 IDs per request
     const byId = new Map();
+
     for (let i = 0; i < ids.length; i += 50) {
         const chunk = ids.slice(i, i + 50);
+
         const apiRes = await axios.get("https://api.spotify.com/v1/tracks", {
             headers: { Authorization: `Bearer ${token}` },
             params: { ids: chunk.join(",") },
@@ -341,13 +366,11 @@ async function fetchTracksByIds(token, ids) {
             if (t?.id) byId.set(t.id, t);
         }
     }
+
     return byId;
 }
 
-// ---- API: Top Tracks (popularity filter that actually works) ----
-// Why this exists: some Spotify endpoints return *simplified* track objects that do NOT include `popularity`.
-// So we (1) fetch up to 100 top-track IDs, (2) look those IDs up via /v1/tracks to get real popularity,
-// (3) filter in top-rank order, returning the first 20 under the user’s threshold.
+// ---- API: Top Tracks ----
 app.get("/api/top-tracks", apiLimiter, async (req, res) => {
     const allowedRanges = new Set(["short_term", "medium_term", "long_term"]);
     const rangeParam = typeof req.query.time_range === "string" ? req.query.time_range : "";
@@ -355,7 +378,7 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
 
     const maxPopularity = clampInt(req.query.max_popularity, 0, 100, 100);
     const limit = 20;
-    const maxScanned = 100; // hard cap: we will never pull more than 100 of the user’s top tracks per click
+    const maxScanned = 100;
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
@@ -368,12 +391,10 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
         let tracksFull;
         let cache_used = false;
 
-        // 1) Cache hit → no Spotify calls needed
         if (cacheFresh) {
             tracksFull = cached.tracks;
             cache_used = true;
         } else {
-            // 2) Cache miss → we WILL call Spotify, so enforce cooldown if rate-limited
             const cooldownUntil = spotifyCooldownUntilByToken.get(token);
             if (cooldownUntil && Date.now() < cooldownUntil) {
                 const remainingSeconds = msToSecondsCeil(cooldownUntil - Date.now());
@@ -383,14 +404,11 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
                 throw e;
             }
 
-            // Fetch up to 100 top tracks (may be simplified)
             const topItems = await fetchUserTopTracks(token, { time_range, maxTracks: maxScanned });
             const ids = topItems.map((t) => t?.id).filter(Boolean);
 
-            // Look up those IDs to get FULL track objects (includes `popularity`)
             const byId = await fetchTracksByIds(token, ids);
 
-            // Preserve the user’s top-track order
             tracksFull = topItems
                 .map((t) => (t?.id ? byId.get(t.id) : null) || t)
                 .filter(Boolean);
@@ -400,15 +418,11 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
 
         const missingPopularity = tracksFull.filter((t) => typeof t?.popularity !== "number").length;
 
-        // Keep original rank order, just filter by popularity and take first 20
-        const filtered = tracksFull.filter((t) => typeof t?.popularity === "number" && t.popularity <= maxPopularity);
+        const filtered = tracksFull.filter(
+            (t) => typeof t?.popularity === "number" && t.popularity <= maxPopularity
+        );
 
-        // If maxPopularity is 100, we still want to show *something* even if popularity is missing.
-        // (With /v1/tracks enrichment, missingPopularity should be 0.)
-        const items =
-            maxPopularity >= 100
-                ? tracksFull.slice(0, limit)
-                : filtered.slice(0, limit);
+        const items = maxPopularity >= 100 ? tracksFull.slice(0, limit) : filtered.slice(0, limit);
 
         return {
             items,
@@ -424,7 +438,7 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
         const payload = await run(accessToken);
         return res.json(payload);
     } catch (err) {
-        // Our manual cooldown throw
+        // Manual cooldown
         if (err?._cooldownSeconds != null) {
             return res.status(429).json({
                 error: `Rate limited. Try again in ${formatCountdown(err._cooldownSeconds)}.`,
@@ -435,7 +449,7 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
 
         const status = err?.response?.status;
 
-        // Token expired or revoked
+        // Expired token -> refresh
         if (status === 401) {
             const newToken = await refreshAccessToken(req, res);
             if (!newToken) {
@@ -449,7 +463,6 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
             } catch (err2) {
                 const status2 = err2?.response?.status;
 
-                // If we got rate limited right after refresh, return the same friendly countdown
                 if (status2 === 429) {
                     const retryAfterSeconds = parseRetryAfterSeconds(err2);
                     if (retryAfterSeconds) {
@@ -468,21 +481,14 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
                     });
                 }
 
-                // If scope is missing after refresh, send the usual scope hint
                 if (status2 === 403) {
                     const spotifyMsg = err2?.response?.data?.error?.message;
-                    const grantedScope = req.cookies["spotify_scope"];
-                    const hint =
-                        "Spotify rejected this request (403). Your token is missing user-top-read. " +
-                        "Go to /logout then /login again (consent screen will re-appear). " +
-                        "If it still fails, confirm you’re logging in with the same Spotify account and the same app client_id.";
-
                     return res.status(403).json({
-                        error: hint,
-                        spotify_message: spotifyMsg,
+                        error: friendly403(spotifyMsg, req),
+                        spotify_message: spotifyMsg || null,
                         expected_scopes: REQUIRED_SCOPES,
                         requested_scopes: SPOTIFY_SCOPES,
-                        token_scopes_seen: grantedScope || null,
+                        token_scopes_seen: req.cookies["spotify_scope"] || null,
                     });
                 }
 
@@ -491,39 +497,30 @@ app.get("/api/top-tracks", apiLimiter, async (req, res) => {
             }
         }
 
-        // Insufficient scope
+        // 403: show real Spotify message + dev-mode allowlist hint if applicable
         if (status === 403) {
             const spotifyMsg = err?.response?.data?.error?.message;
-            const grantedScope = req.cookies["spotify_scope"];
-            const hint =
-                "Spotify rejected this request (403). Your token is missing user-top-read. " +
-                "Go to /logout then /login again (consent screen will re-appear). " +
-                "If it still fails, confirm you’re logging in with the same Spotify account and the same app client_id.";
-
             return res.status(403).json({
-                error: hint,
-                spotify_message: spotifyMsg,
+                error: friendly403(spotifyMsg, req),
+                spotify_message: spotifyMsg || null,
                 expected_scopes: REQUIRED_SCOPES,
                 requested_scopes: SPOTIFY_SCOPES,
-                token_scopes_seen: grantedScope || null,
+                token_scopes_seen: req.cookies["spotify_scope"] || null,
             });
         }
 
-        // Rate limit (429): return formatted countdown + store cooldown
+        // 429: countdown + store cooldown
         if (status === 429) {
             const retryAfterSeconds = parseRetryAfterSeconds(err);
-
             if (retryAfterSeconds) {
                 const until = Date.now() + retryAfterSeconds * 1000;
                 spotifyCooldownUntilByToken.set(accessToken, until);
-
                 return res.status(429).json({
                     error: `Rate limited. Try again in ${formatCountdown(retryAfterSeconds)}.`,
                     retry_after_seconds: retryAfterSeconds,
                     wait_until: new Date(until).toISOString(),
                 });
             }
-
             return res.status(429).json({
                 error: "Rate limited. Please wait a bit and try again.",
                 retry_after_seconds: null,
@@ -542,7 +539,7 @@ app.get("/logout", (req, res) => {
     res.redirect("/");
 });
 
-// ---- Optional debug route (safe to keep; it exposes NO tokens) ----
+// ---- Debug route (no tokens exposed) ----
 app.get("/api/session", (req, res) => {
     const hasAccessToken = Boolean(req.cookies["spotify_access_token"]);
     res.json({
@@ -550,7 +547,6 @@ app.get("/api/session", (req, res) => {
         token_scopes_seen: req.cookies["spotify_scope"] || null,
         using_pkce: USE_PKCE,
         requested_scopes: SPOTIFY_SCOPES,
-        // Helps catch "wrong app / wrong env" issues without exposing secrets.
         client_id_suffix: SPOTIFY_CLIENT_ID ? SPOTIFY_CLIENT_ID.slice(-6) : null,
         redirect_uri: REDIRECT_URI || null,
     });
@@ -561,6 +557,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(`OAuth mode: ${USE_PKCE ? "PKCE (public)" : "Auth Code (confidential)"}`);
+    console.log(`Requested scopes: ${SPOTIFY_SCOPES}`);
     if (!requiredEnvOk()) {
         console.warn("⚠️ Missing SPOTIFY_CLIENT_ID or REDIRECT_URI. /login will fail until you set them.");
     }
