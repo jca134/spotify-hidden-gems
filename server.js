@@ -266,7 +266,7 @@ async function refreshAccessToken(req, res) {
     }
 }
 
-// ---- API: Top Tracks (supports popularity filter + paging) ----
+// ---- API: Top Tracks (popularity filter + hard cap of 100 scanned) ----
 app.get("/api/top-tracks", async (req, res) => {
     const allowedRanges = new Set(["short_term", "medium_term", "long_term"]);
     const rangeParam = typeof req.query.time_range === "string" ? req.query.time_range : "";
@@ -274,8 +274,11 @@ app.get("/api/top-tracks", async (req, res) => {
 
     const limit = 20;
 
-    // No clamp: just convert to number, but default to 100 if missing
-    const maxPopularity = Number(req.query.max_popularity ?? 100);
+    // Parse + clamp popularity defensively.
+    const rawMax = typeof req.query.max_popularity === "string" ? req.query.max_popularity : "100";
+    let maxPopularity = Number(rawMax);
+    if (!Number.isFinite(maxPopularity)) maxPopularity = 100;
+    maxPopularity = Math.max(0, Math.min(100, Math.round(maxPopularity)));
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
@@ -291,39 +294,39 @@ app.get("/api/top-tracks", async (req, res) => {
         });
     }
 
-    const callSpotify = async (token, params) => {
+    const callTopTracks = async (token, params) => {
         return axios.get("https://api.spotify.com/v1/me/top/tracks", {
             headers: { Authorization: `Bearer ${token}` },
             params,
         });
     };
 
+    // Fetch full track objects (incl. popularity) in batches.
+    // This makes the app robust even if some responses return a simplified
+    // track object without the popularity field.
+    const callTracksByIds = async (token, ids) => {
+        return axios.get("https://api.spotify.com/v1/tracks", {
+            headers: { Authorization: `Bearer ${token}` },
+            params: { ids: ids.join(",") },
+        });
+    };
+
     const run = async (token) => {
-        // If maxPopularity is 100, no filtering needed.
-        if (maxPopularity >= 100) {
-            const apiRes = await callSpotify(token, { time_range, limit });
-            return { ...apiRes.data, scanned: apiRes.data?.items?.length ?? 0 };
-        }
-
-        // Otherwise: page through results and filter until we have `limit`.
-        // IMPORTANT: We never request more than 100 tracks total from Spotify per button click.
         const pageSize = 50;
-        const maxScanned = 100; // hard safety cap (tracks requested + scanned)
+        const maxScanned = 100; // hard safety cap
 
+        // 1) Pull up to maxScanned top tracks (order = Spotify's ranking)
         let offset = 0;
         let scanned = 0;
-        const kept = [];
         let total = null;
+        const topItems = [];
 
-        while (scanned < maxScanned && kept.length < limit) {
-            // Clamp the *request size* so the total number of tracks requested from Spotify
-            // across pagination is at most `maxScanned`.
+        while (scanned < maxScanned) {
             const remaining = maxScanned - scanned;
-            if (remaining <= 0) break;
-
             const requestLimit = Math.min(pageSize, remaining);
+            if (requestLimit <= 0) break;
 
-            const apiRes = await callSpotify(token, {
+            const apiRes = await callTopTracks(token, {
                 time_range,
                 limit: requestLimit,
                 offset,
@@ -333,21 +336,40 @@ app.get("/api/top-tracks", async (req, res) => {
             total = typeof apiRes.data?.total === "number" ? apiRes.data.total : total;
 
             scanned += items.length;
+            topItems.push(...items);
 
-            for (const t of items) {
-                if (typeof t?.popularity === "number" && t.popularity <= maxPopularity) {
-                    kept.push(t);
-                    if (kept.length >= limit) break;
-                }
-            }
-
-            // No more data returned → done
-            if (items.length < requestLimit) break;
-
+            if (items.length < requestLimit) break; // no more pages
             offset += requestLimit;
-
-            // If Spotify told us total and we reached it → done
             if (typeof total === "number" && offset >= total) break;
+        }
+
+        // 2) Hydrate via /v1/tracks to guarantee popularity is present
+        const ids = topItems.map((t) => t?.id).filter(Boolean);
+        const idToFull = new Map();
+
+        for (let i = 0; i < ids.length; i += 50) {
+            const batch = ids.slice(i, i + 50);
+            const detailRes = await callTracksByIds(token, batch);
+            const tracks = detailRes.data?.tracks || [];
+            for (const tr of tracks) {
+                if (tr?.id) idToFull.set(tr.id, tr);
+            }
+        }
+
+        const hydrated = topItems.map((t) => {
+            const full = t?.id ? idToFull.get(t.id) : null;
+            return full || t;
+        });
+
+        // 3) Filter and take top 20 under the popularity threshold.
+        const kept = [];
+        for (const t of hydrated) {
+            if (maxPopularity >= 100) {
+                kept.push(t);
+            } else if (typeof t?.popularity === "number" && t.popularity <= maxPopularity) {
+                kept.push(t);
+            }
+            if (kept.length >= limit) break;
         }
 
         return {

@@ -24,9 +24,15 @@ function setLoading(isLoading) {
     loadBtn.textContent = isLoading ? "Loading..." : "Load tracks";
 }
 
-// Keep slider + number input synced (no clamping in JS)
+// Keep slider + number input synced (clamped to 0..100)
 function setPopularityUI(val) {
-    const v = String(val ?? "");
+    // Clamp defensively so we never send "" or "NaN" to the server.
+    // (Typing into a <input type=number> can temporarily be empty.)
+    let n = Number(val);
+    if (!Number.isFinite(n)) n = 100;
+    n = Math.max(0, Math.min(100, Math.round(n)));
+
+    const v = String(n);
     popularitySliderEl.value = v;
     popularityInputEl.value = v;
     popularityHintEl.innerHTML = `Showing tracks with popularity ≤ <strong>${escapeHtml(v)}</strong>`;
@@ -85,8 +91,11 @@ async function loadTopTracks() {
 
         const timeRange = timeRangeEl.value;
 
-        // No clampInt: rely on HTML min/max, but still convert to a number
-        const maxPopularity = Number(popularityInputEl.value);
+        // Parse+clamp. If the field is empty, treat it as 100.
+        let maxPopularity = Number(popularityInputEl.value);
+        if (!Number.isFinite(maxPopularity)) maxPopularity = 100;
+        maxPopularity = Math.max(0, Math.min(100, Math.round(maxPopularity)));
+        setPopularityUI(maxPopularity); // normalize UI to the actual value being used
 
         const res = await fetch(
             `/api/top-tracks?time_range=${encodeURIComponent(timeRange)}&max_popularity=${encodeURIComponent(
