@@ -24,16 +24,9 @@ function setLoading(isLoading) {
     loadBtn.textContent = isLoading ? "Loading..." : "Load tracks";
 }
 
-// Keep slider + number input synced (and clamp to 0..100 so comparisons always work)
-function normalizePopularity(val) {
-    const n = Number(val);
-    if (!Number.isFinite(n)) return 100;
-    return Math.min(100, Math.max(0, Math.trunc(n)));
-}
-
+// Keep slider + number input synced (no clamping in JS)
 function setPopularityUI(val) {
-    const n = normalizePopularity(val);
-    const v = String(n);
+    const v = String(val ?? "");
     popularitySliderEl.value = v;
     popularityInputEl.value = v;
     popularityHintEl.innerHTML = `Showing tracks with popularity ≤ <strong>${escapeHtml(v)}</strong>`;
@@ -92,9 +85,8 @@ async function loadTopTracks() {
 
         const timeRange = timeRangeEl.value;
 
-        const maxPopularity = normalizePopularity(popularityInputEl.value);
-        // Keep UI consistent even if user typed something weird
-        setPopularityUI(maxPopularity);
+        // No clampInt: rely on HTML min/max, but still convert to a number
+        const maxPopularity = Number(popularityInputEl.value);
 
         const res = await fetch(
             `/api/top-tracks?time_range=${encodeURIComponent(timeRange)}&max_popularity=${encodeURIComponent(
@@ -118,25 +110,16 @@ async function loadTopTracks() {
 
         const items = data?.items || [];
         const scanned = data?.scanned;
-        const missingPopularity = data?.missing_popularity;
 
         if (items.length === 0) {
-            setStatus(
-                `No tracks found under popularity ≤ ${maxPopularity}. (Scanned ${scanned ?? "?"} tracks)` +
-                (typeof missingPopularity === "number" && missingPopularity > 0
-                    ? ` — ${missingPopularity} tracks missing popularity data.`
-                    : "")
-            );
+            setStatus(`No tracks found under popularity ≤ ${maxPopularity}. (Scanned ${scanned ?? "?"} tracks)`);
             return;
         }
 
         const shownRange = timeRange.replace("_", " ");
         setStatus(
             `Showing ${items.length} tracks (${shownRange}) with popularity ≤ ${maxPopularity}.` +
-            (typeof scanned === "number" ? ` Scanned ${scanned} tracks.` : "") +
-            (typeof missingPopularity === "number" && missingPopularity > 0
-                ? ` (${missingPopularity} missing popularity.)`
-                : "")
+            (typeof scanned === "number" ? ` Scanned ${scanned} tracks.` : "")
         );
 
         tracksEl.innerHTML = items.map((t, i) => trackCard(t, i)).join("");
