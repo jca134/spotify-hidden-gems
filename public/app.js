@@ -1,3 +1,4 @@
+// ======================= public/app.js (FULL COPY/PASTE) =======================
 const tracksEl = document.getElementById("tracks");
 const statusEl = document.getElementById("status");
 const timeRangeEl = document.getElementById("timeRange");
@@ -49,7 +50,10 @@ function trackCard(track, i) {
     const title = escapeHtml(track?.name ?? "Unknown track");
     const artists = escapeHtml((track?.artists ?? []).map((a) => a.name).join(", ") || "Unknown artist");
 
-    const popularity = typeof track?.popularity === "number" ? track.popularity : "N/A";
+    // robust: handle number or numeric string
+    const popularityNum = Number(track?.popularity);
+    const popularity = Number.isFinite(popularityNum) ? popularityNum : "N/A";
+
     const url = track?.external_urls?.spotify || "#";
 
     return `
