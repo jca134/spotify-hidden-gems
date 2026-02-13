@@ -56,8 +56,15 @@ const isProd = NODE_ENV === "production";
 const hasClientSecret = Boolean(SPOTIFY_CLIENT_SECRET);
 
 // Spotify requires scopes to be space-separated.
+// IMPORTANT: If you set SPOTIFY_SCOPES in Render/env, it can accidentally *override* required scopes.
+// So we always merge REQUIRED_SCOPES into whatever the env provides.
 const REQUIRED_SCOPES = ["user-top-read"]; // needed for /v1/me/top/tracks
-const SPOTIFY_SCOPES = (process.env.SPOTIFY_SCOPES || REQUIRED_SCOPES.join(" ")).trim();
+
+const envScopesRaw = (process.env.SPOTIFY_SCOPES || "").trim();
+// Accept either space-separated or comma-separated lists from env.
+const envScopes = envScopesRaw.length ? envScopesRaw.split(/[\s,]+/).filter(Boolean) : [];
+const scopeSet = new Set([...envScopes, ...REQUIRED_SCOPES]);
+const SPOTIFY_SCOPES = Array.from(scopeSet).join(" ");
 
 // PKCE is only needed when you *don't* have a client secret (public client).
 const USE_PKCE = !hasClientSecret;
@@ -543,6 +550,9 @@ app.get("/api/session", (req, res) => {
         token_scopes_seen: req.cookies["spotify_scope"] || null,
         using_pkce: USE_PKCE,
         requested_scopes: SPOTIFY_SCOPES,
+        // Helps catch "wrong app / wrong env" issues without exposing secrets.
+        client_id_suffix: SPOTIFY_CLIENT_ID ? SPOTIFY_CLIENT_ID.slice(-6) : null,
+        redirect_uri: REDIRECT_URI || null,
     });
 });
 
