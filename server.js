@@ -1,4 +1,3 @@
-// ======================= server.js (FULL COPY/PASTE) =======================
 import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -267,41 +266,6 @@ async function refreshAccessToken(req, res) {
     }
 }
 
-// ---- Explicit Popularity Hydration Helper ----
-// Ensures every returned track has a reliable `popularity` value by calling:
-// GET https://api.spotify.com/v1/tracks?ids=...
-async function hydrateTracksPopularity(token, items) {
-    const ids = items.map((t) => t?.id).filter(Boolean);
-    if (ids.length === 0) return items;
-
-    // Spotify allows up to 50 ids per request
-    const chunks = [];
-    for (let i = 0; i < ids.length; i += 50) chunks.push(ids.slice(i, i + 50));
-
-    const byId = new Map();
-
-    for (const chunk of chunks) {
-        const r = await axios.get("https://api.spotify.com/v1/tracks", {
-            headers: { Authorization: `Bearer ${token}` },
-            params: { ids: chunk.join(",") },
-        });
-
-        const fullTracks = r.data?.tracks || [];
-        for (const t of fullTracks) {
-            if (t?.id) byId.set(t.id, t);
-        }
-    }
-
-    // Merge popularity into original objects while keeping ordering/fields
-    return items.map((t) => {
-        const full = byId.get(t?.id);
-        if (!full) return t;
-
-        const popularity = typeof full.popularity === "number" ? full.popularity : t?.popularity;
-        return { ...t, popularity };
-    });
-}
-
 // ---- API: Top Tracks (supports popularity filter + paging) ----
 app.get("/api/top-tracks", async (req, res) => {
     const allowedRanges = new Set(["short_term", "medium_term", "long_term"]);
@@ -338,15 +302,7 @@ app.get("/api/top-tracks", async (req, res) => {
         // If maxPopularity is 100, no filtering needed.
         if (maxPopularity >= 100) {
             const apiRes = await callSpotify(token, { time_range, limit });
-
-            // Explicitly hydrate popularity for the returned list
-            const hydratedItems = await hydrateTracksPopularity(token, apiRes.data?.items || []);
-
-            return {
-                ...apiRes.data,
-                items: hydratedItems,
-                scanned: apiRes.data?.items?.length ?? 0,
-            };
+            return { ...apiRes.data, scanned: apiRes.data?.items?.length ?? 0 };
         }
 
         // Otherwise: page through results and filter until we have `limit`.
@@ -360,6 +316,8 @@ app.get("/api/top-tracks", async (req, res) => {
         let total = null;
 
         while (scanned < maxScanned && kept.length < limit) {
+            // Clamp the *request size* so the total number of tracks requested from Spotify
+            // across pagination is at most `maxScanned`.
             const remaining = maxScanned - scanned;
             if (remaining <= 0) break;
 
@@ -383,18 +341,17 @@ app.get("/api/top-tracks", async (req, res) => {
                 }
             }
 
+            // No more data returned → done
             if (items.length < requestLimit) break;
 
             offset += requestLimit;
 
+            // If Spotify told us total and we reached it → done
             if (typeof total === "number" && offset >= total) break;
         }
 
-        // Explicitly hydrate popularity for kept tracks (up to 20)
-        const hydratedKept = await hydrateTracksPopularity(token, kept.slice(0, limit));
-
         return {
-            items: hydratedKept,
+            items: kept.slice(0, limit),
             scanned,
             total,
             time_range,
@@ -472,61 +429,6 @@ app.get("/api/top-tracks", async (req, res) => {
     }
 });
 
-// Optional: expose a route in case you ever want to hydrate popularity from the frontend
-app.get("/api/track-popularity", async (req, res) => {
-    let accessToken = req.cookies["spotify_access_token"];
-    if (!accessToken) return res.status(401).json({ error: "Not logged in" });
-
-    const idsParam = typeof req.query.ids === "string" ? req.query.ids : "";
-    const ids = idsParam
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-    if (ids.length === 0) return res.status(400).json({ error: "Missing ids" });
-    if (ids.length > 50) return res.status(400).json({ error: "Too many ids (max 50)" });
-
-    const callTracks = async (token) => {
-        return axios.get("https://api.spotify.com/v1/tracks", {
-            headers: { Authorization: `Bearer ${token}` },
-            params: { ids: ids.join(",") },
-        });
-    };
-
-    try {
-        const r = await callTracks(accessToken);
-        const tracks = r.data?.tracks ?? [];
-        const popularityById = {};
-        for (const t of tracks) {
-            if (t?.id && typeof t?.popularity === "number") popularityById[t.id] = t.popularity;
-        }
-        return res.json({ popularityById });
-    } catch (err) {
-        const status = err?.response?.status;
-
-        if (status === 401) {
-            const newToken = await refreshAccessToken(req, res);
-            if (!newToken) return res.status(401).json({ error: "Session expired. Please log in again." });
-
-            try {
-                const r2 = await callTracks(newToken);
-                const tracks2 = r2.data?.tracks ?? [];
-                const popularityById = {};
-                for (const t of tracks2) {
-                    if (t?.id && typeof t?.popularity === "number") popularityById[t.id] = t.popularity;
-                }
-                return res.json({ popularityById });
-            } catch (err2) {
-                console.error(err2?.response?.data || err2.message);
-                return res.status(500).json({ error: "Failed to hydrate popularity after refresh" });
-            }
-        }
-
-        console.error(err?.response?.data || err.message);
-        return res.status(500).json({ error: "Failed to hydrate popularity" });
-    }
-});
-
 // ---- LOGOUT ----
 app.get("/logout", (req, res) => {
     clearAuthCookies(res);
@@ -543,6 +445,7 @@ app.get("/api/session", (req, res) => {
         requested_scopes: SPOTIFY_SCOPES,
     });
 });
+
 // ---- Start ----
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
