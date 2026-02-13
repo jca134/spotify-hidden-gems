@@ -121,42 +121,6 @@ function authHeaderBasic(clientId, clientSecret) {
     return `Basic ${token}`;
 }
 
-// ---- Spotify API helpers ----
-function spotifyAuthHeaders(token) {
-    return { Authorization: `Bearer ${token}` };
-}
-
-async function spotifyGetTopTracks(token, params) {
-    return axios.get("https://api.spotify.com/v1/me/top/tracks", {
-        headers: spotifyAuthHeaders(token),
-        params,
-    });
-}
-
-// IMPORTANT: popularity lives here, not in /me/top/tracks
-async function spotifyGetTracksByIds(token, ids) {
-    return axios.get("https://api.spotify.com/v1/tracks", {
-        headers: spotifyAuthHeaders(token),
-        params: { ids: ids.join(",") }, // max 50 ids
-    });
-}
-
-// Fetch popularity for a list of track ids, in batches of 50.
-async function fetchPopularityMap(token, ids) {
-    const map = new Map();
-
-    for (let i = 0; i < ids.length; i += 50) {
-        const batch = ids.slice(i, i + 50);
-        const tracksRes = await spotifyGetTracksByIds(token, batch);
-        const tracks = tracksRes.data?.tracks || [];
-        for (const tr of tracks) {
-            if (tr?.id) map.set(tr.id, tr.popularity);
-        }
-    }
-
-    return map;
-}
-
 // ---- LOGIN ----
 app.get("/login", authLimiter, (req, res) => {
     if (!requiredEnvOk()) {
@@ -310,10 +274,8 @@ app.get("/api/top-tracks", async (req, res) => {
 
     const limit = 20;
 
-    // Convert to number; default 100 if missing or invalid
-    const maxPopularityRaw = req.query.max_popularity ?? 100;
-    const maxPopularity = Number(maxPopularityRaw);
-    const maxPopularitySafe = Number.isFinite(maxPopularity) ? maxPopularity : 100;
+    // No clamp: just convert to number, but default to 100 if missing
+    const maxPopularity = Number(req.query.max_popularity ?? 100);
 
     let accessToken = req.cookies["spotify_access_token"];
     if (!accessToken) return res.status(401).json({ error: "Not logged in" });
@@ -329,25 +291,39 @@ app.get("/api/top-tracks", async (req, res) => {
         });
     }
 
+    const callSpotify = async (token, params) => {
+        return axios.get("https://api.spotify.com/v1/me/top/tracks", {
+            headers: { Authorization: `Bearer ${token}` },
+            params,
+        });
+    };
+
     const run = async (token) => {
-        // We never request more than 100 top tracks total per button click.
+        // If maxPopularity is 100, no filtering needed.
+        if (maxPopularity >= 100) {
+            const apiRes = await callSpotify(token, { time_range, limit });
+            return { ...apiRes.data, scanned: apiRes.data?.items?.length ?? 0 };
+        }
+
+        // Otherwise: page through results and filter until we have `limit`.
+        // IMPORTANT: We never request more than 100 tracks total from Spotify per button click.
         const pageSize = 50;
-        const maxScanned = 100;
+        const maxScanned = 100; // hard safety cap (tracks requested + scanned)
 
         let offset = 0;
         let scanned = 0;
+        const kept = [];
         let total = null;
 
-        const kept = [];
-
         while (scanned < maxScanned && kept.length < limit) {
+            // Clamp the *request size* so the total number of tracks requested from Spotify
+            // across pagination is at most `maxScanned`.
             const remaining = maxScanned - scanned;
             if (remaining <= 0) break;
 
             const requestLimit = Math.min(pageSize, remaining);
 
-            // 1) get top tracks page (no popularity here)
-            const apiRes = await spotifyGetTopTracks(token, {
+            const apiRes = await callSpotify(token, {
                 time_range,
                 limit: requestLimit,
                 offset,
@@ -358,25 +334,11 @@ app.get("/api/top-tracks", async (req, res) => {
 
             scanned += items.length;
 
-            // If nothing returned, stop.
-            if (items.length === 0) break;
-
-            // 2) fetch popularity for these items via /v1/tracks
-            const ids = items.map((t) => t?.id).filter(Boolean);
-            const popularityById = await fetchPopularityMap(token, ids);
-
-            // 3) attach popularity and filter
             for (const t of items) {
-                const pop = popularityById.get(t.id);
-                const withPop = { ...t, popularity: typeof pop === "number" ? pop : null };
-
-                if (maxPopularitySafe >= 100) {
-                    kept.push(withPop);
-                } else if (typeof withPop.popularity === "number" && withPop.popularity <= maxPopularitySafe) {
-                    kept.push(withPop);
+                if (typeof t?.popularity === "number" && t.popularity <= maxPopularity) {
+                    kept.push(t);
+                    if (kept.length >= limit) break;
                 }
-
-                if (kept.length >= limit) break;
             }
 
             // No more data returned → done
@@ -393,7 +355,7 @@ app.get("/api/top-tracks", async (req, res) => {
             scanned,
             total,
             time_range,
-            max_popularity: maxPopularitySafe,
+            max_popularity: maxPopularity,
         };
     };
 
