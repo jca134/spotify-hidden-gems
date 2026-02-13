@@ -134,7 +134,6 @@ async function loadTopTracks() {
         setLoading(false);
     }
 }
-
 // Button click
 loadBtn.addEventListener("click", loadTopTracks);
 

@@ -543,7 +543,6 @@ app.get("/api/session", (req, res) => {
         requested_scopes: SPOTIFY_SCOPES,
     });
 });
-
 // ---- Start ----
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
